@@ -5,3 +5,7 @@
 /igbot-tmp
 *.log
 cookies.txt
+
+# AI-agent working notes + design/planning docs — kept locally, not committed
+/agent_logs/
+/docs/

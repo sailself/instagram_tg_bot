@@ -1,0 +1,8 @@
+[Unit]
+Description=igbot keepalive — nudge network to dodge OCI idle reclaim (PLAN §7.5)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/curl -s -o /dev/null https://api.telegram.org

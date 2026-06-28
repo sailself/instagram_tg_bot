@@ -1,0 +1,42 @@
+[Unit]
+Description=Instagram -> Telegram mirror bot
+After=network-online.target
+Wants=network-online.target
+# Restart-storm guard (these directives live in [Unit], not [Service]).
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/igbot
+EnvironmentFile=/etc/igbot/igbot.env
+ExecStart=/opt/igbot/igbot
+
+# --- reliability ---
+Restart=always
+RestartSec=5
+
+# --- memory guards for the 1 GB box (PLAN §7.2) ---
+# Soft-throttle then hard-cap; a runaway yt-dlp child is killed in this cgroup
+# instead of OOM-killing the host. Leave ~200 MB for the OS.
+MemoryHigh=650M
+MemoryMax=800M
+OOMPolicy=continue
+TasksMax=128
+
+# --- hardening ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/igbot
+
+# --- logging ---
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=igbot
+
+[Install]
+WantedBy=multi-user.target

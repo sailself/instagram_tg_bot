@@ -1,0 +1,8 @@
+[Unit]
+Description=Update yt-dlp (Instagram extractor breaks often; PLAN §7.4)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/yt-dlp -U

@@ -1,0 +1,34 @@
+[package]
+name = "igbot"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Telegram bot that mirrors Instagram posts/reels into a group chat"
+license = "MIT"
+
+[dependencies]
+teloxide = { version = "0.17", features = ["macros", "throttle"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "sync", "time", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+scraper = "0.20"
+regex = "1"
+async-trait = "0.1"
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+moka = { version = "0.12", features = ["future"] }
+url = "2"
+tempfile = "3"
+html-escape = "0.2"
+dotenvy = "0.15"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

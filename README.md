@@ -119,8 +119,45 @@ timer, and a 5-minute **keepalive** (so the always-free VM isn't reclaimed for
 idleness). The bot uses **long polling**, so **no inbound ports / TLS / domain**
 are required. Memory is guarded by `MemoryMax=800M` + single-worker concurrency.
 
-**Update to a new release:** download the new tarball, then
-`sudo install -o botuser -g botuser -m0755 igbot /opt/igbot/igbot && sudo systemctl restart igbot`.
+## Upgrading to a new release
+
+It's a **binary swap** — no new system deps, and new config (e.g. Threads) ships
+with working defaults, so `igbot.env` needs no changes. Replace `v0.2.0` below
+with the tag you're moving to.
+
+```bash
+# 1. download + verify the new release
+cd /tmp
+base=igbot-v0.2.0-linux-x86_64.tar.gz
+url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.2.0
+curl -L -O "$url/$base" && curl -L -O "$url/$base.sha256"
+sha256sum -c "$base.sha256" && tar -xzf "$base"   # → /tmp/igbot
+
+# 2. back up the current binary (for instant rollback)
+sudo cp -a /opt/igbot/igbot /opt/igbot/igbot.bak
+
+# 3. swap + restart. Stop first: replacing a *running* executable in place
+#    errors with "Text file busy". Long polling → downtime is a few seconds.
+sudo systemctl stop igbot
+sudo install -o botuser -g botuser -m 0755 /tmp/igbot /opt/igbot/igbot
+sudo systemctl start igbot
+
+# 4. verify it took
+systemctl status igbot --no-pager
+journalctl -u igbot -n 50 --no-pager | grep -Ei 'config loaded|extractor chain'
+```
+
+A successful upgrade logs both `instagram extractor chain built` and
+`threads extractor chain built` at startup (and `threads=true` in the config
+summary line). Then post a real link in your group to confirm.
+
+**Rollback** if anything looks wrong:
+
+```bash
+sudo systemctl stop igbot
+sudo mv /opt/igbot/igbot.bak /opt/igbot/igbot
+sudo systemctl start igbot
+```
 
 ## Logs
 

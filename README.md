@@ -99,8 +99,8 @@ cd instagram_tg_bot
 
 # 2. download + verify the release binary
 cd /tmp
-base=igbot-v0.1.0-linux-x86_64.tar.gz
-url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.1.0
+base=igbot-v0.2.0-linux-x86_64.tar.gz
+url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.2.0
 curl -L -O "$url/$base" && curl -L -O "$url/$base.sha256"
 sha256sum -c "$base.sha256" && tar -xzf "$base"   # → /tmp/igbot
 

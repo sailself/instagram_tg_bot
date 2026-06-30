@@ -146,6 +146,11 @@ async fn handle(
     cfg: &Config,
     job: &Job,
 ) -> anyhow::Result<Outcome> {
+    // Live "typing…" indicator in the chat header for the whole job. The guard
+    // aborts the keepalive when this function returns — or when its future is
+    // dropped because the wall-clock timeout fired (see `process_job`).
+    let _typing = sender::typing_indicator(bot, job.chat_id);
+
     match chain.extract(&job.original_url, &job.shortcode).await {
         Ok(post) => {
             let media = post.media.len();

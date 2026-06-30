@@ -13,9 +13,11 @@ use crate::media::{download_capped, temp_filename, DownloadError};
 use crate::queue::Job;
 use crate::urls::Platform;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use teloxide::prelude::*;
 use teloxide::types::{
-    InputFile, InputMedia, InputMediaPhoto, InputMediaVideo, LinkPreviewOptions, ReplyParameters,
+    ChatAction, ChatId, InputFile, InputMedia, InputMediaPhoto, InputMediaVideo, LinkPreviewOptions,
+    ReplyParameters,
 };
 use url::Url;
 
@@ -285,6 +287,47 @@ pub async fn reply_failure(bot: &TgBot, job: &Job, text: &str) -> anyhow::Result
     reply_text(bot, job, text).await
 }
 
+/// A periodic background task that is **aborted when this guard is dropped**.
+/// Telegram chat actions expire after ~5 s, so we re-send on an interval for as
+/// long as the guard lives (i.e. for the duration of the job).
+pub struct Keepalive(tokio::task::JoinHandle<()>);
+
+impl Keepalive {
+    /// Run `tick` immediately, then every `interval`, until the guard is dropped.
+    pub fn start<F, Fut>(interval: Duration, mut tick: F) -> Self
+    where
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        Self(tokio::spawn(async move {
+            loop {
+                tick().await;
+                tokio::time::sleep(interval).await;
+            }
+        }))
+    }
+}
+
+impl Drop for Keepalive {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Show a live "typing…" status in the chat header while a job runs, and stop
+/// when the returned guard drops (delivered, failed, or timed out). Telegram
+/// expires a chat action after ~5 s, so it is re-sent every 4 s. Best-effort:
+/// send errors are ignored — the indicator is cosmetic and never blocks delivery.
+pub fn typing_indicator(bot: &TgBot, chat_id: ChatId) -> Keepalive {
+    let bot = bot.clone();
+    Keepalive::start(Duration::from_secs(4), move || {
+        let bot = bot.clone();
+        async move {
+            let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
+        }
+    })
+}
+
 /// Build the media caption (≤1024 UTF-16 units, keeping a truncated preview of
 /// the caption text) and, if it overflows, the full caption to send as a
 /// follow-up message (PLAN §5).
@@ -441,5 +484,28 @@ mod tests {
         let parts = split_utf16(&"a".repeat(9000), TEXT_LIMIT);
         assert_eq!(parts.len(), 3);
         assert!(parts.iter().all(|p| utf16_len(p) <= TEXT_LIMIT));
+    }
+
+    #[tokio::test]
+    async fn keepalive_ticks_while_alive_then_stops_on_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        let guard = Keepalive::start(Duration::from_millis(5), move || {
+            let c = c.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        // Ticks while the guard is alive.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(count.load(Ordering::SeqCst) >= 1, "should tick while alive");
+        // Dropping the guard aborts the task — no further ticks.
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(20)).await; // let any in-flight tick settle
+        let after = count.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(count.load(Ordering::SeqCst), after, "no ticks after drop");
     }
 }

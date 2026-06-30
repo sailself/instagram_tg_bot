@@ -2,8 +2,7 @@
 //! upstream-maintained. Weak on pure-image posts — that's why embed leads and
 //! gallery-dl (cookies) backstops images.
 
-use super::{truncate_chars, ExtractError, InstagramExtractor, Media, Post};
-use crate::urls::post_url;
+use super::{truncate_chars, ExtractError, Extractor, Media, Post};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::io::ErrorKind;
@@ -21,13 +20,12 @@ impl YtDlpExtractor {
 }
 
 #[async_trait]
-impl InstagramExtractor for YtDlpExtractor {
+impl Extractor for YtDlpExtractor {
     fn name(&self) -> &'static str {
         "yt-dlp"
     }
 
-    async fn extract(&self, _url: &str, shortcode: &str) -> Result<Post, ExtractError> {
-        let target = post_url(shortcode);
+    async fn extract(&self, url: &str, _shortcode: &str) -> Result<Post, ExtractError> {
         let mut cmd = Command::new(&self.path);
         cmd.arg("-J")
             .arg("--no-warnings")
@@ -36,7 +34,7 @@ impl InstagramExtractor for YtDlpExtractor {
         if let Some(c) = &self.cookies {
             cmd.arg("--cookies").arg(c);
         }
-        cmd.arg(&target);
+        cmd.arg(url);
 
         let output = match cmd.output().await {
             Ok(o) => o,
@@ -62,7 +60,7 @@ impl InstagramExtractor for YtDlpExtractor {
         tracing::debug!(stdout_bytes = output.stdout.len(), "yt-dlp ok");
         let value: Value = serde_json::from_slice(&output.stdout)
             .map_err(|e| ExtractError::Transient(format!("yt-dlp json: {e}")))?;
-        parse_info(&value, &target).ok_or(ExtractError::NotFound)
+        parse_info(&value, url).ok_or(ExtractError::NotFound)
     }
 }
 

@@ -3,10 +3,9 @@
 //! set — inactive under the cookieless-first default.
 
 use super::{
-    dedup_media, is_ig_cdn, media_by_ext, normalize_cdn_url, truncate_chars, ExtractError,
-    InstagramExtractor, Post,
+    dedup_media, is_meta_cdn, media_by_ext, normalize_cdn_url, truncate_chars, ExtractError,
+    Extractor, Post,
 };
-use crate::urls::post_url;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::io::ErrorKind;
@@ -24,20 +23,19 @@ impl GalleryDlExtractor {
 }
 
 #[async_trait]
-impl InstagramExtractor for GalleryDlExtractor {
+impl Extractor for GalleryDlExtractor {
     fn name(&self) -> &'static str {
         "gallery-dl"
     }
 
-    async fn extract(&self, _url: &str, shortcode: &str) -> Result<Post, ExtractError> {
-        let target = post_url(shortcode);
+    async fn extract(&self, url: &str, _shortcode: &str) -> Result<Post, ExtractError> {
         let mut cmd = Command::new(&self.path);
         cmd.arg("-j")
             .arg("--cookies")
             .arg(&self.cookies)
             .arg("--sleep-request")
             .arg("2.0")
-            .arg(&target);
+            .arg(url);
 
         let output = match cmd.output().await {
             Ok(o) => o,
@@ -63,7 +61,7 @@ impl InstagramExtractor for GalleryDlExtractor {
         tracing::debug!(stdout_bytes = output.stdout.len(), "gallery-dl ok");
         let value: Value = serde_json::from_slice(&output.stdout)
             .map_err(|e| ExtractError::Transient(format!("gallery-dl json: {e}")))?;
-        parse(&value, &target).ok_or(ExtractError::NotFound)
+        parse(&value, url).ok_or(ExtractError::NotFound)
     }
 }
 
@@ -92,7 +90,7 @@ fn parse(v: &Value, original_url: &str) -> Option<Post> {
         let Some(elems) = item.as_array() else { continue };
         for e in elems {
             match e {
-                Value::String(s) if is_ig_cdn(s) => media.push(media_by_ext(&normalize_cdn_url(s))),
+                Value::String(s) if is_meta_cdn(s) => media.push(media_by_ext(&normalize_cdn_url(s))),
                 Value::Object(o) => {
                     if caption.is_none() {
                         caption = o

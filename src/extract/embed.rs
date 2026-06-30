@@ -7,10 +7,9 @@
 //! OG) and retries intermittent transient responses.
 
 use super::{
-    dedup_media, is_ig_cdn, map_status, normalize_cdn_url, ExtractError, InstagramExtractor, Media,
-    Post,
+    collect_meta_media, dedup_media, is_meta_cdn, map_status, normalize_cdn_url, ExtractError,
+    Extractor, Media, Post,
 };
-use crate::urls::post_url;
 use async_trait::async_trait;
 use scraper::{Html, Selector};
 use serde_json::Value;
@@ -58,19 +57,19 @@ impl EmbedScraper {
 }
 
 #[async_trait]
-impl InstagramExtractor for EmbedScraper {
+impl Extractor for EmbedScraper {
     fn name(&self) -> &'static str {
         "embed"
     }
 
     async fn extract(&self, url: &str, shortcode: &str) -> Result<Post, ExtractError> {
-        let target = post_url(shortcode);
-
+        // Fetch the canonical post URL the detector built (Instagram's
+        // `/p/<code>/` page); `shortcode` keys the embedded-JSON match.
         for attempt in 0..MAX_ATTEMPTS {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(300 * (1 << attempt))).await;
             }
-            match self.fetch(&target).await {
+            match self.fetch(url).await {
                 Ok(html) => {
                     if let Some(post) = parse_post(&html, shortcode, url) {
                         return Ok(post);
@@ -154,7 +153,7 @@ fn parse_polaris_json(
         let Some(node) = find_post_node(&value, shortcode) else {
             continue;
         };
-        let media = polaris_media(node);
+        let media = collect_meta_media(node);
         if media.is_empty() {
             continue;
         }
@@ -190,42 +189,6 @@ fn find_post_node<'a>(v: &'a Value, shortcode: &str) -> Option<&'a Value> {
         }
         Value::Array(arr) => arr.iter().find_map(|child| find_post_node(child, shortcode)),
         _ => None,
-    }
-}
-
-/// Collect media from a matched post node, expanding carousels into children.
-fn polaris_media(node: &Value) -> Vec<Media> {
-    let mut out = Vec::new();
-    if let Some(children) = node.pointer("/carousel_media").and_then(Value::as_array) {
-        for child in children {
-            polaris_single(child, &mut out);
-        }
-    } else {
-        polaris_single(node, &mut out);
-    }
-    out
-}
-
-/// Push one image or video from a (child) node. Prefers the playable video —
-/// a video node also carries an `image_versions2` poster we must not send as a
-/// still (mirrors the legacy-shape behaviour).
-fn polaris_single(node: &Value, out: &mut Vec<Media>) {
-    if let Some(u) = node
-        .pointer("/video_versions/0/url")
-        .and_then(Value::as_str)
-        .map(normalize_cdn_url)
-        .filter(|u| is_ig_cdn(u))
-    {
-        out.push(Media::video(u));
-        return;
-    }
-    if let Some(u) = node
-        .pointer("/image_versions2/candidates/0/url")
-        .and_then(Value::as_str)
-        .map(normalize_cdn_url)
-        .filter(|u| is_ig_cdn(u))
-    {
-        out.push(Media::image(u));
     }
 }
 
@@ -333,12 +296,12 @@ fn push_single(node: &Value, out: &mut Vec<Media>) {
 fn parse_html_shape(doc: &Html) -> (Option<String>, Option<String>, Vec<Media>) {
     let mut media = Vec::new();
     for src in all_attrs(doc, "img.EmbeddedMediaImage, .EmbeddedMediaImage img, img[referrerpolicy]", "src") {
-        if is_ig_cdn(&src) {
+        if is_meta_cdn(&src) {
             media.push(Media::image(normalize_cdn_url(&src)));
         }
     }
     for src in all_attrs(doc, "video, video source", "src") {
-        if is_ig_cdn(&src) {
+        if is_meta_cdn(&src) {
             media.push(Media::video(normalize_cdn_url(&src)));
         }
     }
@@ -350,11 +313,11 @@ fn parse_html_shape(doc: &Html) -> (Option<String>, Option<String>, Vec<Media>) 
 fn parse_og_shape(doc: &Html) -> (Option<String>, Option<String>, Vec<Media>) {
     let mut media = Vec::new();
     let video = first_attr(doc, r#"meta[property="og:video"], meta[property="og:video:secure_url"]"#, "content");
-    if let Some(v) = video.filter(|v| is_ig_cdn(v)) {
+    if let Some(v) = video.filter(|v| is_meta_cdn(v)) {
         media.push(Media::video(normalize_cdn_url(&v)));
     } else {
         for img in all_attrs(doc, r#"meta[property="og:image"]"#, "content") {
-            if is_ig_cdn(&img) {
+            if is_meta_cdn(&img) {
                 media.push(Media::image(normalize_cdn_url(&img)));
             }
         }
@@ -427,7 +390,7 @@ mod tests {
         assert_eq!(post.media[0].kind, MediaKind::Image);
         // & must have been decoded back to a literal &.
         assert!(post.media[0].url.contains("?nc=1&oe=ABC"), "url={}", post.media[0].url);
-        assert!(is_ig_cdn(&post.media[0].url));
+        assert!(is_meta_cdn(&post.media[0].url));
     }
 
     #[test]
@@ -513,7 +476,7 @@ mod tests {
         assert_eq!(post.media.len(), 1, "only SC's single video");
         assert_eq!(post.media[0].kind, MediaKind::Video);
         assert!(post.media[0].url.contains("reel.mp4?x=1&y=2"), "url={}", post.media[0].url);
-        assert!(is_ig_cdn(&post.media[0].url));
+        assert!(is_meta_cdn(&post.media[0].url));
     }
 
     #[test]

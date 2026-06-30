@@ -4,11 +4,10 @@
 //! before relying on them. Sits LAST in the chain.
 
 use super::{
-    dedup_media, is_ig_cdn, map_status, media_by_ext, normalize_cdn_url, ExtractError,
-    InstagramExtractor, Media, Post,
+    dedup_media, is_meta_cdn, map_status, media_by_ext, normalize_cdn_url, ExtractError, Extractor,
+    Media, Post,
 };
 use crate::config::Config;
-use crate::urls::post_url;
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
@@ -50,8 +49,8 @@ impl ExternalFallback {
 
     /// Jina Reader (PLAN §4.8). Needs a free key for IG; `X-No-Cache` keeps our
     /// group's links out of the shared cache.
-    async fn jina(&self, shortcode: &str) -> Result<(Option<String>, Option<String>, Vec<Media>), ExtractError> {
-        let endpoint = format!("https://r.jina.ai/{}", post_url(shortcode));
+    async fn jina(&self, url: &str) -> Result<(Option<String>, Option<String>, Vec<Media>), ExtractError> {
+        let endpoint = format!("https://r.jina.ai/{url}");
         let mut req = self
             .http
             .get(&endpoint)
@@ -104,10 +103,10 @@ impl ExternalFallback {
     }
 
     /// EmbedEZ keyless: search → key, then embed. Best-effort (under-documented).
-    async fn embedez(&self, shortcode: &str) -> Result<(Option<String>, Option<String>, Vec<Media>), ExtractError> {
+    async fn embedez(&self, url: &str) -> Result<(Option<String>, Option<String>, Vec<Media>), ExtractError> {
         let search = format!(
             "https://embedez.com/api/v1/search?q={}",
-            percent_encode(&post_url(shortcode))
+            percent_encode(url)
         );
         let r1 = self
             .http
@@ -155,7 +154,7 @@ impl ExternalFallback {
 }
 
 #[async_trait]
-impl InstagramExtractor for ExternalFallback {
+impl Extractor for ExternalFallback {
     fn name(&self) -> &'static str {
         match self.provider {
             Provider::Jina => "reader(jina)",
@@ -163,10 +162,10 @@ impl InstagramExtractor for ExternalFallback {
         }
     }
 
-    async fn extract(&self, url: &str, shortcode: &str) -> Result<Post, ExtractError> {
+    async fn extract(&self, url: &str, _shortcode: &str) -> Result<Post, ExtractError> {
         let (author, caption, media) = match self.provider {
-            Provider::Jina => self.jina(shortcode).await?,
-            Provider::EmbedEz => self.embedez(shortcode).await?,
+            Provider::Jina => self.jina(url).await?,
+            Provider::EmbedEz => self.embedez(url).await?,
         };
         if media.is_empty() {
             return Err(ExtractError::NotFound);
@@ -184,7 +183,7 @@ fn cdn_urls_in(text: &str) -> Vec<Media> {
     CDN_RE
         .find_iter(text)
         .map(|m| normalize_cdn_url(m.as_str()))
-        .filter(|u| is_ig_cdn(u))
+        .filter(|u| is_meta_cdn(u))
         .map(|u| media_by_ext(&u))
         .collect()
 }
@@ -192,7 +191,7 @@ fn cdn_urls_in(text: &str) -> Vec<Media> {
 fn collect_images_field(data: &Value) -> Vec<Media> {
     let mut out = Vec::new();
     let push = |s: &str, out: &mut Vec<Media>| {
-        if is_ig_cdn(s) {
+        if is_meta_cdn(s) {
             out.push(media_by_ext(&normalize_cdn_url(s)));
         }
     };

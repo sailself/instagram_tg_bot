@@ -39,7 +39,6 @@ async fn main() -> Result<()> {
     let tgbot = teloxide::Bot::new(cfg.bot_token.clone()).throttle(Limits::default());
     preflight(&tgbot).await?;
 
-    let chain = Arc::new(extract::build_chain(&cfg, http.clone()));
     let dedup = dedup::Dedup::new(cfg.cache_ttl);
     let metrics = Arc::new(metrics::Metrics::new());
 
@@ -48,17 +47,21 @@ async fn main() -> Result<()> {
         metrics::spawn_heartbeat(metrics.clone(), interval);
     }
 
-    // Bounded queue → single worker (concurrency = 1).
+    // Bounded queue → single worker (concurrency = 1). The worker routes each
+    // job to the Instagram or Threads chain by platform.
     let (tx, rx) = tokio::sync::mpsc::channel::<queue::Job>(cfg.queue_capacity);
     {
         let bot = tgbot.clone();
-        let chain = chain.clone();
+        let chains = queue::Chains {
+            instagram: Arc::new(extract::build_ig_chain(&cfg, http.clone())),
+            threads: Arc::new(extract::build_threads_chain(&cfg, http.clone())),
+        };
         let cfg = cfg.clone();
         let http = http.clone();
         let dedup = dedup.clone();
         let metrics = metrics.clone();
         tokio::spawn(async move {
-            queue::run_worker(rx, bot, chain, http, cfg, dedup, metrics).await;
+            queue::run_worker(rx, bot, chains, http, cfg, dedup, metrics).await;
         });
     }
 

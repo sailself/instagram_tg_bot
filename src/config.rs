@@ -19,6 +19,12 @@ AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 const DEFAULT_EMBED_UA: &str = "facebookexternalhit/1.1 \
 (+http://www.facebook.com/externalhit_uatext.php)";
 
+/// `sec-ch-ua` client-hint matching `DEFAULT_UA`'s Chrome major. Threads serves
+/// its server-rendered post JSON only to a coherent browser header set, so this
+/// pairs with the desktop UA; a mismatched/crawler UA gets the empty SPA shell.
+const DEFAULT_THREADS_SEC_CH_UA: &str =
+    "\"Not/A)Brand\";v=\"8\", \"Chromium\";v=\"126\", \"Google Chrome\";v=\"126\"";
+
 const FIFTY_MIB: u64 = 50 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -37,6 +43,15 @@ pub struct Config {
     pub user_agent: String,
     /// UA for the in-process embed/post-page scrape (crawler UA; see above).
     pub embed_user_agent: String,
+    /// Threads support kill-switch (default on). Gates link detection/enqueue.
+    pub threads_enabled: bool,
+    /// UA for the in-process Threads scrape — must be a real desktop-browser UA.
+    /// Threads gates its server-rendered post JSON on a coherent browser header
+    /// set; a crawler UA returns an empty shell. Hot-config `THREADS_USER_AGENT`.
+    pub threads_user_agent: String,
+    /// `sec-ch-ua` client-hint sent with the Threads scrape; keep coherent with
+    /// `threads_user_agent`. Hot-config `THREADS_SEC_CH_UA`.
+    pub threads_sec_ch_ua: String,
     pub max_upload_bytes: u64,
     pub queue_capacity: usize,
     pub job_timeout: Duration,
@@ -65,6 +80,10 @@ impl Config {
             jina_api_key: opt("JINA_API_KEY"),
             user_agent: opt("USER_AGENT").unwrap_or_else(|| DEFAULT_UA.into()),
             embed_user_agent: opt("EMBED_USER_AGENT").unwrap_or_else(|| DEFAULT_EMBED_UA.into()),
+            threads_enabled: parse_bool("THREADS_ENABLED", true),
+            threads_user_agent: opt("THREADS_USER_AGENT").unwrap_or_else(|| DEFAULT_UA.into()),
+            threads_sec_ch_ua: opt("THREADS_SEC_CH_UA")
+                .unwrap_or_else(|| DEFAULT_THREADS_SEC_CH_UA.into()),
             max_upload_bytes: parse_u64("MAX_UPLOAD_BYTES", FIFTY_MIB)?,
             queue_capacity: parse_u64("QUEUE_CAPACITY", 16)? as usize,
             job_timeout: Duration::from_secs(parse_u64("JOB_TIMEOUT_SECS", 90)?),
@@ -83,7 +102,7 @@ impl Config {
     pub fn summary(&self) -> String {
         format!(
             "allowed_chats={} queue_cap={} cache_ttl={}s job_timeout={}s pacing={}ms \
-max_upload={}MB cookies={} fallback={} jina_key={} heartbeat={} embed_ua={:?}",
+max_upload={}MB cookies={} fallback={} threads={} jina_key={} heartbeat={} embed_ua={:?}",
             self.allowed_chats.len(),
             self.queue_capacity,
             self.cache_ttl.as_secs(),
@@ -92,6 +111,7 @@ max_upload={}MB cookies={} fallback={} jina_key={} heartbeat={} embed_ua={:?}",
             self.max_upload_bytes / (1024 * 1024),
             self.ig_cookies_path.is_some(),
             self.fallback_provider.as_deref().unwrap_or("none"),
+            self.threads_enabled,
             self.jina_api_key.is_some(),
             self.heartbeat.map_or_else(|| "off".to_string(), |d| format!("{}s", d.as_secs())),
             self.embed_user_agent,
@@ -116,6 +136,15 @@ fn parse_u64(var: &'static str, default: u64) -> Result<u64, AppError> {
             .parse::<u64>()
             .map_err(|e| AppError::InvalidEnv { var, msg: e.to_string() }),
         None => Ok(default),
+    }
+}
+
+/// Parse a boolean env flag. Unset → `default`; set → true unless it reads as a
+/// negative (`0`/`false`/`no`/`off`). `opt` already drops empty values.
+fn parse_bool(var: &str, default: bool) -> bool {
+    match opt(var) {
+        Some(s) => !matches!(s.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        None => default,
     }
 }
 
@@ -198,6 +227,9 @@ mod tests {
             jina_api_key: None,
             user_agent: "ua".into(),
             embed_user_agent: "crawler-ua".into(),
+            threads_enabled: true,
+            threads_user_agent: "th-ua".into(),
+            threads_sec_ch_ua: "th-ch".into(),
             max_upload_bytes: FIFTY_MIB,
             queue_capacity: 16,
             job_timeout: Duration::from_secs(90),

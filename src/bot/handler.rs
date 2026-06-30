@@ -5,7 +5,7 @@ use crate::bot::TgBot;
 use crate::config::Config;
 use crate::dedup::Dedup;
 use crate::queue::Job;
-use crate::urls;
+use crate::urls::{self, Platform};
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::{MessageEntityKind, ReplyParameters};
@@ -23,7 +23,7 @@ pub async fn on_message(
     }
 
     let haystack = collect_text(&msg);
-    let links = urls::find_instagram_links(&haystack);
+    let links = urls::find_links(&haystack);
     if links.is_empty() {
         return Ok(());
     }
@@ -35,11 +35,18 @@ pub async fn on_message(
         .map(|u| u.username.clone().unwrap_or_else(|| u.id.0.to_string()));
 
     for link in links {
-        if dedup.seen_or_claim(&link.shortcode).await {
-            tracing::debug!(shortcode = %link.shortcode, "duplicate within TTL, skipping");
+        // Threads support is a config-gated kill-switch; Instagram is always on.
+        if link.platform == Platform::Threads && !cfg.threads_enabled {
+            tracing::debug!(shortcode = %link.shortcode, "threads disabled, skipping link");
+            continue;
+        }
+        let dedup_key = link.platform.dedup_key(&link.shortcode);
+        if dedup.seen_or_claim(&dedup_key).await {
+            tracing::debug!(key = %dedup_key, "duplicate within TTL, skipping");
             continue;
         }
         tracing::info!(
+            platform = ?link.platform,
             shortcode = %link.shortcode,
             chat = msg.chat.id.0,
             user = poster.as_deref().unwrap_or("?"),
@@ -48,21 +55,22 @@ pub async fn on_message(
         let job = Job {
             chat_id: msg.chat.id,
             reply_to: msg.id,
-            original_url: link.original_url,
+            platform: link.platform,
+            original_url: link.canonical_url,
             shortcode: link.shortcode,
         };
         match tx.try_send(job) {
             Ok(()) => {}
             // Couldn't enqueue → release the claim so the suggested retry works.
             Err(TrySendError::Full(job)) => {
-                dedup.forget(&job.shortcode).await;
+                dedup.forget(&job.dedup_key()).await;
                 let _ = bot
                     .send_message(msg.chat.id, "🐢 Busy right now — try that link again in a moment.")
                     .reply_parameters(ReplyParameters::new(msg.id))
                     .await;
             }
             Err(TrySendError::Closed(job)) => {
-                dedup.forget(&job.shortcode).await;
+                dedup.forget(&job.dedup_key()).await;
                 tracing::error!("job channel closed; worker is gone");
             }
         }

@@ -5,11 +5,13 @@ Guidance for any AI agent (Claude Code, Codex, etc.) working in this repo.
 
 ## What this is
 
-A Rust Telegram bot that mirrors **Instagram** posts/reels into a Telegram
-group: it watches the chat, and when a member posts an instagram.com link
-(`/p/`, `/reel/`, `/tv/`) it replies with the post's media (images/videos,
-including carousels), caption, and author. Free to run; targets an **OCI Always
-Free 1 OCPU / 1 GB** VM. Long polling, **cookieless-first**.
+A Rust Telegram bot that mirrors **Instagram** *and* **Threads** posts into a
+Telegram group: it watches the chat, and when a member posts an instagram.com
+link (`/p/`, `/reel/`, `/tv/`) or a threads.com / threads.net link
+(`/@user/post/…`) it replies with the post's media (images/videos, including
+carousels), caption, and author — and, for Threads' text-first posts, the text
+itself when there's no media. Free to run; targets an **OCI Always Free 1 OCPU /
+1 GB** VM. Long polling, **cookieless-first**.
 
 ## Read first
 
@@ -33,22 +35,31 @@ output before claiming anything works.
 
 ```
 teloxide long-poll dispatcher
-  → handler.rs: chat allowlist + scan text/entities for IG links → dedup claim
+  → handler.rs: chat allowlist + scan text/entities for IG/Threads links
+       (find_links → Platform-tagged) → namespaced dedup claim (ig:/th:)
   → bounded mpsc → SINGLE worker (concurrency = 1)
-  → ExtractorChain: embed → yt-dlp (+ gallery-dl if cookies) (+ external fallback if configured)
-  → sender.rs: caption ladder + album chunking + URL→download→link delivery ladder
+  → route by Platform (queue.rs `Chains`) to the matching ExtractorChain:
+       IG:      embed → yt-dlp (+ gallery-dl if cookies) (+ external if configured)
+       Threads: threads-json → threads-embed   (accept_textonly = true)
+  → sender.rs: caption ladder + album chunking + URL→download→link delivery
+       ladder; media-less posts → text reply (split into 4096-UTF-16 chunks)
   → reply to the original message
 ```
 
-Backends implement the pluggable `InstagramExtractor` trait (`src/extract/mod.rs`).
-The embed scraper is in-process and primary; yt-dlp is the video backstop.
+Backends implement the pluggable `Extractor` trait (`src/extract/mod.rs`) — it
+takes the canonical post `url` + shortcode and returns a `Post`, so it serves
+both platforms (route by **host**, not shortcode). The IG embed scraper and the
+Threads JSON scraper share the Polaris media-collection (`collect_meta_media`).
+yt-dlp/gallery-dl do **not** support Threads, so the Threads chain is in-process
+only (`threads_json` primary, `threads_embed` the `/embed`-HTML fallback).
 
 ## Invariants & gotchas — these are landmines, respect them
 
-- **IG CDN URLs**: capture **verbatim**. HTML-entity / JSON-unicode decode before
-  fetching (use `normalize_cdn_url`), but **never trim, reorder, or re-encode
-  query params** — the whole query string is the signature; touching it →
-  `403 "Bad URL hash"`.
+- **Meta CDN URLs (Instagram + Threads)**: capture **verbatim**. HTML-entity /
+  JSON-unicode decode before fetching (use `normalize_cdn_url`), but **never
+  trim, reorder, or re-encode query params** — the whole query string is the
+  signature; touching it → `403 "Bad URL hash"`. Threads media rides the same
+  signed Meta CDN as Instagram.
 - **Telegram lengths are UTF-16 code units, not `char`s.** Use
   `utf16_len`/`truncate_utf16`/`split_utf16` in `sender.rs`; never gate caption
   (1024) or text (4096) limits on `chars().count()` (emoji silently overflow).
@@ -59,10 +70,20 @@ The embed scraper is in-process and primary; yt-dlp is the video backstop.
   process. Prevent them: no `unwrap()`/`expect()` on runtime-fallible paths, and
   keep the `preflight` `get_me` guard before `dispatch()` (teloxide panics if its
   startup call fails).
-- **`is_ig_cdn` must host-parse**, never substring-match (substring match is an
-  SSRF/exfil vector).
-- **Cookieless-first.** Do NOT enable Instagram login/cookies or the external
-  fallback by default — both are config-gated (`IG_COOKIES_PATH`,
+- **`is_meta_cdn` must host-parse**, never substring-match (substring match is an
+  SSRF/exfil vector). It allowlists `*.cdninstagram.com` / `*.fbcdn.net`, which
+  serve **both** Instagram and Threads media — there is no per-platform CDN list.
+- **Text-only posts are valid output** (Threads is text-first). The Threads chain
+  is built `accept_textonly`, so a caption-only `Post` is success and `sender.rs`
+  delivers it as text; never classify "no media but has caption" as a failure for
+  Threads. The IG chain keeps media required.
+- **Threads header gate**: the post JSON is served logged-out **only** to a
+  *coherent desktop-browser* header set (`THREADS_USER_AGENT` /
+  `THREADS_SEC_CH_UA`, hot-config). A naive/crawler UA returns HTTP 200 + an
+  **empty shell** (0 `thread_items`) — classify that as a failure, **never**
+  silent success.
+- **Cookieless-first.** Do NOT enable Instagram/Threads login/cookies or the
+  external fallback by default — config-gated (`IG_COOKIES_PATH`,
   `FALLBACK_PROVIDER`). Any cookie use is a disposable burner, never a real
   account.
 - **Memory discipline on 1 GB**: concurrency = 1, capped streaming downloads,
@@ -71,17 +92,21 @@ The embed scraper is in-process and primary; yt-dlp is the video backstop.
   user reply — never leave the user in silence. Errors are classified
   (`NotFound`/`Blocked`/`Transient`/`Unavailable`); the chain surfaces the most
   actionable one.
-- **Dedup semantics**: claim a shortcode on enqueue, and `forget()` it on any
-  failure (or if it's never enqueued). Only a *successfully delivered* post stays
-  deduped for the TTL.
+- **Dedup semantics**: claim on enqueue, `forget()` on any failure (or if never
+  enqueued). Only a *successfully delivered* post stays deduped for the TTL. Keys
+  are **namespaced per platform** (`Platform::dedup_key` → `ig:`/`th:`) — IG and
+  Threads shortcodes share an alphabet and would otherwise collide across
+  platforms.
 
 ## Conventions
 
 - Brittle externals (User-Agent, embed/GraphQL endpoints, `doc_id`) are
   **hot-config via env**, not baked-in literals — a breakage should be a config
   change, not a recompile.
-- Parsers are unit-tested against **captured sample payloads** (offline,
-  deterministic). Add a test when you touch parsing logic.
+- Parsers are unit-tested against **captured / representative sample payloads**
+  (offline, deterministic). Add a test when you touch parsing logic. The Threads
+  fixtures mirror the observed JSON/HTML shape; live behavior still needs
+  validation (see below).
 - Logging via `tracing`. **Never log secrets** (token, cookies).
 
 ## Deployment
@@ -95,9 +120,12 @@ keepalive against idle reclaim). The bot token and chat allowlist live in
 ## Verification before "done"
 
 Run `cargo test` and `cargo clippy --all-targets` and a release build; cite the
-output. Don't assert success without evidence. Note that the embed scraper and
-the external/gallery-dl backends need **live validation against real Instagram
-posts** — unit tests cover parsing of captured payloads, not live behavior.
+output. Don't assert success without evidence. The IG embed/external/gallery-dl
+backends need **live validation against real Instagram posts**, and the
+**Threads** scraper (the working header set, repost/quote JSON nesting,
+poll-option visibility, age-gated/private behavior) needs **live validation
+against real Threads posts** — unit tests cover parsing of captured/representative
+payloads, not live behavior.
 
 ## Agent Execution Logging
 

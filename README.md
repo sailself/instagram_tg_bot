@@ -3,18 +3,24 @@
 [![CI](https://github.com/sailself/instagram_tg_bot/actions/workflows/ci.yml/badge.svg)](https://github.com/sailself/instagram_tg_bot/actions/workflows/ci.yml)
 
 A Rust Telegram bot that watches a group chat and, whenever someone posts an
-**Instagram** link (post `/p/`, reel `/reel/`, or `/tv/`), replies to that
-message with the post's **media (images/videos, incl. carousels), caption, and
-author**. Free to run; designed for an **OCI Always Free 1 OCPU / 1 GB** VM.
+**Instagram** link (post `/p/`, reel `/reel/`, `/tv/`) or a **Threads** link
+(`threads.com` / `threads.net` `/@user/post/…`), replies to that message with the
+post's **media (images/videos, incl. carousels), caption, and author** — and, for
+Threads' text-first posts, the **text** itself when there's no media. Free to
+run; designed for an **OCI Always Free 1 OCPU / 1 GB** VM.
 
 ## How it works
 
 ```
-group msg ─(teloxide, long-poll)→ detect IG link → dedup → bounded queue
-        → single worker → extractor chain → reply (album / photo / video)
+group msg ─(teloxide, long-poll)→ detect IG / Threads link → route by host
+        → dedup → bounded queue → single worker → per-platform extractor chain
+        → reply (album / photo / video / text)
 ```
 
-**Extractor chain** (first backend that returns media wins):
+Links are routed by **host** (never by shortcode — IG and Threads share the same
+code alphabet), and dedup keys are namespaced per platform (`ig:` / `th:`).
+
+**Instagram chain** (first backend that returns media wins):
 
 1. **embed** — in-process, anonymous scrape of the public **post page** with a
    *crawler* User-Agent (`facebookexternalhit`, hot-config via
@@ -27,7 +33,20 @@ group msg ─(teloxide, long-poll)→ detect IG link → dedup → bounded queue
 4. **external fallback** — *only if* `FALLBACK_PROVIDER` is set (Jina / EmbedEZ);
    fetches from a different IP when ours is blocked. Off by default.
 
-Cookieless-first: no Instagram login required for the default chain.
+**Threads chain** (neither yt-dlp nor gallery-dl supports Threads, so it's
+in-process only):
+
+1. **threads-json** — anonymous scrape of the public post page. Threads serves
+   logged-out clients the full post JSON server-side (the same Polaris shape as
+   Instagram) inside `<script type="application/json">` blocks — but *only* to a
+   coherent **desktop-browser** header set (hot-config `THREADS_USER_AGENT` /
+   `THREADS_SEC_CH_UA`); a naive UA gets an empty shell, which is treated as a
+   failure, never a silent success. Covers images, video, carousels (up to 20),
+   text-only / poll / link-card posts, and reposts/quotes.
+2. **threads-embed** — fallback parse of the `/embed` SSR HTML card.
+
+Cookieless-first: no Instagram **or** Threads login required for the default
+chains.
 
 ## Prerequisites
 
@@ -125,7 +144,9 @@ See [`.env.example`](.env.example) for everything. Key variables:
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | **required** — BotFather token |
 | `ALLOWED_CHAT_IDS` | comma-separated chat ids; empty = any chat |
-| `EMBED_USER_AGENT` | crawler UA for the embed scraper (hot-config) |
+| `EMBED_USER_AGENT` | crawler UA for the IG embed scraper (hot-config) |
+| `THREADS_ENABLED` | set `0/false/no/off` to ignore Threads links (default on) |
+| `THREADS_USER_AGENT` / `THREADS_SEC_CH_UA` | desktop-browser UA + matching client-hint for the Threads scrape (hot-config) |
 | `RUST_LOG` | log filter (`igbot=info,warn` default; `igbot=debug` for detail) |
 | `HEARTBEAT_SECS` / `LOG_DIR` / `LOG_MAX_FILES` | metrics heartbeat / optional rotating file logs |
 | `IG_COOKIES_PATH` | enables the gallery-dl + cookie path (use a **burner** only) |
@@ -139,6 +160,11 @@ is a config change, not a recompile.
 - Instagram extraction is inherently fragile; the chain + caching + graceful
   failure replies absorb intermittent blocks. The crawler-UA embed path is the
   primary mechanism and may need an `EMBED_USER_AGENT` change if IG shifts again.
+- Threads extraction is gated on a coherent desktop-browser header set; if
+  Threads shifts, change `THREADS_USER_AGENT` / `THREADS_SEC_CH_UA` (no
+  recompile). An empty-shell response is classified as a failure, so users get a
+  graceful reply rather than silence. The Threads scrape, repost/quote nesting,
+  and poll rendering still want **live validation** against real posts.
 - Albums are sent as up to 10 items (Telegram album max); extras are noted.
 - Bot API upload cap is 50 MB; larger videos get a link + note instead.
 - This scrapes public, logged-out content. Adding burner cookies is opt-in and

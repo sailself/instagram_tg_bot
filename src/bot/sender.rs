@@ -11,6 +11,7 @@ use crate::config::Config;
 use crate::extract::{Media, MediaKind, Post};
 use crate::media::{download_capped, temp_filename, DownloadError};
 use crate::queue::Job;
+use crate::urls::Platform;
 use std::path::{Path, PathBuf};
 use teloxide::prelude::*;
 use teloxide::types::{
@@ -36,8 +37,20 @@ pub async fn deliver(
     let started = std::time::Instant::now();
     let n = post.media.len();
     tracing::debug!(media = n, "delivering");
-    let (caption, overflow) = compose_caption(&post);
 
+    // Text-only post (Threads is text-first): no media — deliver the caption +
+    // author + link as text, never a media call (PLAN §4.8 / Threads design).
+    if n == 0 {
+        send_text_post(bot, job, &post).await?;
+        tracing::debug!(
+            media = 0,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "delivered text-only"
+        );
+        return Ok(());
+    }
+
+    let (caption, overflow) = compose_caption(&post, job.platform);
     if n == 1 {
         send_one(bot, http, cfg, job, &post.media[0], &caption).await?;
     } else {
@@ -50,6 +63,18 @@ pub async fn deliver(
         }
     }
     tracing::debug!(media = n, elapsed_ms = started.elapsed().as_millis() as u64, "delivered");
+    Ok(())
+}
+
+/// Deliver a media-less post (Threads text / poll / link-card) as text: header
+/// (`🧵 @author`) + caption + link, split into ≤4096-UTF-16 chunks. The chain
+/// only yields a text-only Post when the caption is non-blank, so this never
+/// sends an empty message.
+async fn send_text_post(bot: &TgBot, job: &Job, post: &Post) -> anyhow::Result<()> {
+    let full = compose_full_text(post, job.platform);
+    for chunk in split_utf16(&full, TEXT_LIMIT) {
+        reply_text(bot, job, &chunk).await?;
+    }
     Ok(())
 }
 
@@ -263,11 +288,11 @@ pub async fn reply_failure(bot: &TgBot, job: &Job, text: &str) -> anyhow::Result
 /// Build the media caption (≤1024 UTF-16 units, keeping a truncated preview of
 /// the caption text) and, if it overflows, the full caption to send as a
 /// follow-up message (PLAN §5).
-fn compose_caption(post: &Post) -> (String, Option<String>) {
+fn compose_caption(post: &Post, platform: Platform) -> (String, Option<String>) {
     let header = post
         .author
         .as_ref()
-        .map(|a| format!("📷 @{a}\n\n"))
+        .map(|a| format!("{} @{a}\n\n", platform.emoji()))
         .unwrap_or_default();
     let body = post.caption.as_deref().unwrap_or("").trim().to_string();
     let footer = format!("\n\n🔗 {}", post.original_url);
@@ -289,6 +314,19 @@ fn compose_caption(post: &Post) -> (String, Option<String>) {
     let truncated = truncate_utf16(&body, budget);
     let caption = format!("{header}{truncated}{ellipsis}{footer}");
     (caption, Some(body))
+}
+
+/// The full text for a media-less post: `<emoji> @author` + caption + `🔗 url`,
+/// untruncated — the caller splits it into ≤4096-UTF-16 chunks.
+fn compose_full_text(post: &Post, platform: Platform) -> String {
+    let header = post
+        .author
+        .as_ref()
+        .map(|a| format!("{} @{a}\n\n", platform.emoji()))
+        .unwrap_or_default();
+    let body = post.caption.as_deref().unwrap_or("").trim();
+    let footer = format!("\n\n🔗 {}", post.original_url);
+    format!("{header}{body}{footer}")
 }
 
 /// Length in UTF-16 code units (how Telegram counts).
@@ -350,7 +388,8 @@ mod tests {
 
     #[test]
     fn short_caption_fits_inline() {
-        let (cap, overflow) = compose_caption(&post_with(Some("nasa"), Some("hello world")));
+        let (cap, overflow) =
+            compose_caption(&post_with(Some("nasa"), Some("hello world")), Platform::Instagram);
         assert!(cap.contains("@nasa"));
         assert!(cap.contains("hello world"));
         assert!(cap.contains("🔗"));
@@ -360,7 +399,7 @@ mod tests {
     #[test]
     fn long_caption_truncates_on_media_and_overflows_full() {
         let long = "x".repeat(2000);
-        let (cap, overflow) = compose_caption(&post_with(Some("u"), Some(&long)));
+        let (cap, overflow) = compose_caption(&post_with(Some("u"), Some(&long)), Platform::Instagram);
         assert!(utf16_len(&cap) <= CAPTION_LIMIT);
         assert!(cap.contains('…'));
         assert!(cap.contains("xxxx"), "some caption text retained on media");
@@ -371,9 +410,23 @@ mod tests {
     fn emoji_caption_respects_utf16_budget() {
         // 600 cameras = 1200 UTF-16 units (>1024) though only 600 chars.
         let body = "📷".repeat(600);
-        let (cap, overflow) = compose_caption(&post_with(None, Some(&body)));
+        let (cap, overflow) = compose_caption(&post_with(None, Some(&body)), Platform::Instagram);
         assert!(utf16_len(&cap) <= CAPTION_LIMIT);
         assert!(overflow.is_some());
+    }
+
+    #[test]
+    fn textonly_compose_includes_author_caption_and_link() {
+        let post = Post {
+            author: Some("zuck".into()),
+            caption: Some("just thinking out loud".into()),
+            media: vec![],
+            original_url: "https://www.threads.com/@zuck/post/ABC".into(),
+        };
+        let text = compose_full_text(&post, Platform::Threads);
+        assert!(text.contains("🧵 @zuck"), "text={text}");
+        assert!(text.contains("just thinking out loud"));
+        assert!(text.contains("🔗 https://www.threads.com/@zuck/post/ABC"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 # igbot
 
 [![CI](https://github.com/sailself/instagram_tg_bot/actions/workflows/ci.yml/badge.svg)](https://github.com/sailself/instagram_tg_bot/actions/workflows/ci.yml)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/sailself/instagram_tg_bot)
 
 A Rust Telegram bot that watches a group chat and, whenever someone posts an
 **Instagram** link (post `/p/`, reel `/reel/`, `/tv/`) or a **Threads** link

@@ -100,8 +100,8 @@ cd instagram_tg_bot
 
 # 2. download + verify the release binary
 cd /tmp
-base=igbot-v0.2.1-linux-x86_64.tar.gz
-url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.2.1
+base=igbot-v0.3.0-linux-x86_64.tar.gz
+url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.3.0
 curl -L -O "$url/$base" && curl -L -O "$url/$base.sha256"
 sha256sum -c "$base.sha256" && tar -xzf "$base"   # → /tmp/igbot
 
@@ -122,15 +122,17 @@ are required. Memory is guarded by `MemoryMax=800M` + single-worker concurrency.
 
 ## Upgrading to a new release
 
-It's a **binary swap** — no new system deps, and new config (e.g. Threads) ships
-with working defaults, so `igbot.env` needs no changes. Replace `v0.2.1` below
-with the tag you're moving to.
+It's a **binary swap** — no new system deps, and new config ships with working
+defaults, so `igbot.env` usually needs no changes. One exception for **v0.3.0**:
+if your `igbot.env` pins `JOB_TIMEOUT_SECS=90`, remove the line (or raise it) —
+the default is now 300 s so multi-album deliveries aren't cut off mid-send.
+Replace `v0.3.0` below with the tag you're moving to.
 
 ```bash
 # 1. download + verify the new release
 cd /tmp
-base=igbot-v0.2.1-linux-x86_64.tar.gz
-url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.2.1
+base=igbot-v0.3.0-linux-x86_64.tar.gz
+url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.3.0
 curl -L -O "$url/$base" && curl -L -O "$url/$base.sha256"
 sha256sum -c "$base.sha256" && tar -xzf "$base"   # → /tmp/igbot
 

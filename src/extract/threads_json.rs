@@ -8,11 +8,14 @@
 //! The JSON reuses Instagram's Polaris/Barcelona shape (`code`, `media_type`,
 //! `image_versions2`, `video_versions`, `carousel_media`, `caption.text`,
 //! `user.username`), so media collection is shared via [`collect_meta_media`].
+//! An Instagram post shared inline to Threads rides along as a full Polaris
+//! node under `text_post_app_info/linked_inline_media` (observed live); its
+//! media is appended after the post's own via [`collect_threads_media`].
 //!
 //! NB: the exact nesting for quote/repost (`text_post_app_info.share_info.*`) is
 //! best-effort and flagged for live validation; it degrades to the outer post.
 
-use super::{collect_meta_media, dedup_media, map_status, ExtractError, Extractor, Post};
+use super::{collect_meta_media, dedup_media, map_status, ExtractError, Extractor, Media, Post};
 use async_trait::async_trait;
 use scraper::{Html, Selector};
 use serde_json::Value;
@@ -176,11 +179,26 @@ fn find_thread_post<'a>(v: &'a Value, shortcode: &str) -> Option<&'a Value> {
     }
 }
 
+/// Media of a Threads post node: its own media plus any Instagram post shared
+/// inline (`text_post_app_info/linked_inline_media` — a full Polaris media
+/// node riding along; observed live on share-to-Threads posts, where
+/// `share_info.quoted_post`/`reposted_post` stay null). Own media first.
+fn collect_threads_media(node: &Value) -> Vec<Media> {
+    let mut media = collect_meta_media(node);
+    if let Some(linked) = node
+        .pointer("/text_post_app_info/linked_inline_media")
+        .filter(|n| n.is_object())
+    {
+        media.extend(collect_meta_media(linked));
+    }
+    media
+}
+
 /// Build a [`Post`] from a matched node, resolving reposts/quotes (Threads
 /// design: a pure repost → mirror the original; a quote-post → outer content +
 /// a link/attribution to the inner post).
 fn build_post(node: &Value, original_url: &str) -> Option<Post> {
-    let media = collect_meta_media(node);
+    let media = collect_threads_media(node);
     let mut caption = caption_of(node);
     let author = author_of(node);
     let has_own =
@@ -205,7 +223,7 @@ fn build_post(node: &Value, original_url: &str) -> Option<Post> {
 
     // Pure repost: the outer post is empty — mirror the inner (original) post.
     if let Some(inner) = inner_post(node) {
-        let inner_media = collect_meta_media(inner);
+        let inner_media = collect_threads_media(inner);
         let inner_caption = caption_of(inner);
         if !inner_media.is_empty()
             || inner_caption.as_deref().is_some_and(|c| !c.trim().is_empty())
@@ -393,6 +411,68 @@ mod tests {
         assert!(cap.contains("hot take"), "outer text kept: {cap}");
         assert!(cap.contains("🔁 Quoting @author"), "inner attribution: {cap}");
         assert!(cap.contains("https://www.threads.com/@author/post/INNER"), "inner link: {cap}");
+    }
+
+    #[test]
+    fn text_post_with_linked_instagram_video_sends_the_video() {
+        // Observed live (2026-07): a share-to-Threads text post (media_type 19,
+        // no own media) carries the attached IG post as a full Polaris node
+        // under text_post_app_info.linked_inline_media, while the share_info
+        // quote/repost members stay null.
+        let html = script(
+            r#"{"thread_items":[{"post":{"code":"SC","media_type":19,"pk":"1",
+              "caption":{"text":"看世界盃這麼貴啊😂"},"user":{"username":"dr.kyle"},
+              "image_versions2":null,"video_versions":null,"carousel_media":null,
+              "text_post_app_info":{
+                "share_info":{"quoted_post":null,"reposted_post":null},
+                "linked_inline_media":{
+                  "code":"INNERIG","media_type":2,"caption":null,
+                  "image_versions2":{"candidates":[{"url":"https://instagram.fyvr2-1.fna.fbcdn.net/v/poster.jpg?a=1"}]},
+                  "video_versions":[{"type":101,"url":"https://instagram.fyvr2-1.fna.fbcdn.net/o1/v/clip.mp4?efg=abc&oe=AA"}],
+                  "user":{"username":"dr.kyle"}}}}}]}"#,
+        );
+        let p = post(&html, "SC").unwrap();
+        assert_eq!(p.caption.as_deref(), Some("看世界盃這麼貴啊😂"));
+        assert_eq!(p.author.as_deref(), Some("dr.kyle"));
+        assert_eq!(p.media.len(), 1, "linked IG video collected, not its poster");
+        assert_eq!(p.media[0].kind, MediaKind::Video);
+        assert!(p.media[0].url.contains("clip.mp4?efg=abc&oe=AA"), "url={}", p.media[0].url);
+    }
+
+    #[test]
+    fn own_media_precedes_linked_media() {
+        let html = script(
+            r#"{"thread_items":[{"post":{"code":"SC","media_type":1,
+              "image_versions2":{"candidates":[{"url":"https://scontent.cdninstagram.com/v/own.jpg"}]},
+              "caption":{"text":"mine plus a share"},"user":{"username":"u"},
+              "text_post_app_info":{"linked_inline_media":{
+                "code":"L","media_type":2,
+                "image_versions2":{"candidates":[{"url":"https://scontent.cdninstagram.com/v/lp.jpg"}]},
+                "video_versions":[{"type":101,"url":"https://scontent.cdninstagram.com/v/linked.mp4"}]}}}}]}"#,
+        );
+        let p = post(&html, "SC").unwrap();
+        assert_eq!(p.media.len(), 2);
+        assert!(p.media[0].url.ends_with("own.jpg"), "own media first");
+        assert_eq!(p.media[1].kind, MediaKind::Video);
+        assert!(p.media[1].url.ends_with("linked.mp4"));
+    }
+
+    #[test]
+    fn repost_of_post_with_linked_media_mirrors_it() {
+        // A pure repost whose original carries an inline-shared IG video.
+        let html = script(
+            r#"{"thread_items":[{"post":{"code":"SC","user":{"username":"reposter"},
+              "text_post_app_info":{"share_info":{"reposted_post":{
+                "code":"INNER","media_type":19,"caption":{"text":"orig"},"user":{"username":"author"},
+                "text_post_app_info":{"linked_inline_media":{
+                  "code":"L","media_type":2,
+                  "video_versions":[{"type":101,"url":"https://scontent.cdninstagram.com/v/in.mp4"}]}}}}}}}]}"#,
+        );
+        let p = post(&html, "SC").unwrap();
+        assert_eq!(p.author.as_deref(), Some("author"));
+        assert_eq!(p.caption.as_deref(), Some("orig"));
+        assert_eq!(p.media.len(), 1);
+        assert!(p.media[0].url.ends_with("in.mp4"));
     }
 
     #[test]

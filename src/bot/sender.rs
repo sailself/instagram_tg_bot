@@ -1,4 +1,5 @@
-//! Build the reply: caption ladder (≤1024 UTF-16 units + overflow follow-up),
+//! Build the reply: caption composition (≤1024 UTF-16 units, longer captions
+//! truncated — the tail is dropped, never re-sent as a follow-up message),
 //! single media vs chunked albums (`send_media_group`, 2–10 items), and the
 //! delivery ladder — `InputFile::url` first, then download-then-upload, then a
 //! link+note fallback (PLAN §5 / §6).
@@ -52,17 +53,11 @@ pub async fn deliver(
         return Ok(());
     }
 
-    let (caption, overflow) = compose_caption(&post, job.platform);
+    let caption = compose_caption(&post, job.platform);
     if n == 1 {
         send_one(bot, http, cfg, job, &post.media[0], &caption).await?;
     } else {
         send_album(bot, http, cfg, job, &post.media, &caption).await?;
-    }
-
-    if let Some(full) = overflow {
-        for chunk in split_utf16(&full, TEXT_LIMIT) {
-            reply_text(bot, job, &chunk).await?;
-        }
     }
     tracing::debug!(media = n, elapsed_ms = started.elapsed().as_millis() as u64, "delivered");
     Ok(())
@@ -328,10 +323,11 @@ pub fn typing_indicator(bot: &TgBot, chat_id: ChatId) -> Keepalive {
     })
 }
 
-/// Build the media caption (≤1024 UTF-16 units, keeping a truncated preview of
-/// the caption text) and, if it overflows, the full caption to send as a
-/// follow-up message (PLAN §5).
-fn compose_caption(post: &Post, platform: Platform) -> (String, Option<String>) {
+/// Build the media caption: `<emoji> @author` + caption + `🔗 url`, capped at
+/// ≤1024 UTF-16 units. A longer caption is truncated with an ellipsis and the
+/// tail is **dropped** — the post is always a single reply, never followed by
+/// a full-text message (the 🔗 link still leads to the full text) (PLAN §5).
+fn compose_caption(post: &Post, platform: Platform) -> String {
     let header = post
         .author
         .as_ref()
@@ -342,21 +338,18 @@ fn compose_caption(post: &Post, platform: Platform) -> (String, Option<String>) 
 
     let everything = format!("{header}{body}{footer}");
     if utf16_len(&everything) <= CAPTION_LIMIT {
-        let combined = if body.is_empty() {
+        return if body.is_empty() {
             format!("{header}🔗 {}", post.original_url).trim().to_string()
         } else {
             everything
         };
-        return (combined, None);
     }
 
-    // Keep a truncated caption on the media; send the full caption as follow-up.
     let ellipsis = "…";
     let reserved = utf16_len(&header) + utf16_len(&footer) + utf16_len(ellipsis);
     let budget = CAPTION_LIMIT.saturating_sub(reserved);
     let truncated = truncate_utf16(&body, budget);
-    let caption = format!("{header}{truncated}{ellipsis}{footer}");
-    (caption, Some(body))
+    format!("{header}{}{ellipsis}{footer}", truncated.trim_end())
 }
 
 /// The full text for a media-less post: `<emoji> @author` + caption + `🔗 url`,
@@ -431,31 +424,30 @@ mod tests {
 
     #[test]
     fn short_caption_fits_inline() {
-        let (cap, overflow) =
+        let cap =
             compose_caption(&post_with(Some("nasa"), Some("hello world")), Platform::Instagram);
         assert!(cap.contains("@nasa"));
         assert!(cap.contains("hello world"));
         assert!(cap.contains("🔗"));
-        assert!(overflow.is_none());
     }
 
     #[test]
-    fn long_caption_truncates_on_media_and_overflows_full() {
+    fn long_caption_truncates_and_drops_tail() {
         let long = "x".repeat(2000);
-        let (cap, overflow) = compose_caption(&post_with(Some("u"), Some(&long)), Platform::Instagram);
+        let cap = compose_caption(&post_with(Some("u"), Some(&long)), Platform::Instagram);
         assert!(utf16_len(&cap) <= CAPTION_LIMIT);
         assert!(cap.contains('…'));
         assert!(cap.contains("xxxx"), "some caption text retained on media");
-        assert_eq!(overflow.as_deref(), Some(long.as_str()));
+        assert!(cap.contains("🔗"), "link footer survives truncation");
     }
 
     #[test]
     fn emoji_caption_respects_utf16_budget() {
         // 600 cameras = 1200 UTF-16 units (>1024) though only 600 chars.
         let body = "📷".repeat(600);
-        let (cap, overflow) = compose_caption(&post_with(None, Some(&body)), Platform::Instagram);
+        let cap = compose_caption(&post_with(None, Some(&body)), Platform::Instagram);
         assert!(utf16_len(&cap) <= CAPTION_LIMIT);
-        assert!(overflow.is_some());
+        assert!(cap.contains('…'));
     }
 
     #[test]

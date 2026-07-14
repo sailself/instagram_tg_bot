@@ -41,8 +41,9 @@ teloxide long-poll dispatcher
   → route by Platform (queue.rs `Chains`) to the matching ExtractorChain:
        IG:      embed → yt-dlp (+ gallery-dl if cookies) (+ external if configured)
        Threads: threads-json → threads-embed   (accept_textonly = true)
-  → sender.rs: caption ladder + album chunking + URL→download→link delivery
-       ladder; media-less posts → text reply (split into 4096-UTF-16 chunks)
+  → sender.rs: caption ≤1024 (longer → truncated "…", tail dropped, no
+       follow-up) + album chunking + URL→download→link delivery ladder;
+       media-less posts → text reply (split into 4096-UTF-16 chunks)
   → reply to the original message
 ```
 

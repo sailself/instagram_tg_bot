@@ -35,8 +35,17 @@ async fn main() -> Result<()> {
         .user_agent(cfg.user_agent.clone())
         .build()?;
 
+    // Telegram API client with a generous request timeout: big media-group
+    // sends (server-side URL fetches / multipart uploads) far outlast
+    // teloxide's 17 s default, and timing out a request Telegram then
+    // completes anyway yields a phantom "couldn't send" failure.
+    let tg_http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(cfg.tg_send_timeout)
+        .build()?;
     // Throttled bot (innermost wrap) for built-in rate limiting (PLAN §5).
-    let tgbot = teloxide::Bot::new(cfg.bot_token.clone()).throttle(Limits::default());
+    let tgbot =
+        teloxide::Bot::with_client(cfg.bot_token.clone(), tg_http).throttle(Limits::default());
     preflight(&tgbot).await?;
 
     let dedup = dedup::Dedup::new(cfg.cache_ttl);
@@ -118,7 +127,13 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::{fmt, EnvFilter};
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "igbot=info,warn".into());
-    let stdout_layer = fmt::layer().with_target(false);
+    // Plain text by default: ANSI styling shows up as `[3m`/`[2m` noise in
+    // journald, log files, and consoles without VT processing (terminal
+    // detection can't see those). Colors are opt-in via LOG_ANSI=1.
+    let ansi = std::env::var("LOG_ANSI")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    let stdout_layer = fmt::layer().compact().with_target(false).with_ansi(ansi);
 
     // Optional rotating file layer. journald already persists stdout on the VM,
     // so this is opt-in (LOG_DIR). Build failure → warn + stdout-only; never
@@ -144,6 +159,7 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
                     // than stall the async runtime on disk I/O.
                     let (writer, guard) = tracing_appender::non_blocking(appender);
                     let layer = fmt::layer()
+                        .compact()
                         .with_ansi(false)
                         .with_target(false)
                         .with_writer(writer);

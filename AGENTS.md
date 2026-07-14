@@ -41,9 +41,11 @@ teloxide long-poll dispatcher
   → route by Platform (queue.rs `Chains`) to the matching ExtractorChain:
        IG:      embed → yt-dlp (+ gallery-dl if cookies) (+ external if configured)
        Threads: threads-json → threads-embed   (accept_textonly = true)
-  → sender.rs: caption ≤1024 (longer → truncated "…", tail dropped, no
-       follow-up) + album chunking + URL→download→link delivery ladder;
-       media-less posts → text reply (split into 4096-UTF-16 chunks)
+  → sender.rs: captions ≤1024 each, long text continues across the album
+       chunks' captions on word boundaries with "…" seam markers (tail past
+       the last chunk → dropped, no follow-up) + album chunking +
+       URL→download→link delivery ladder; media-less posts → text reply
+       (4096-UTF-16 chunks, same word-boundary flow)
   → reply to the original message
 ```
 
@@ -66,6 +68,14 @@ only (`threads_json` primary, `threads_embed` the `/embed`-HTML fallback).
   (1024) or text (4096) limits on `chars().count()` (emoji silently overflow).
 - **Media groups are 2–10 items.** One item must go via `send_photo`/`send_video`;
   chunk >10 into successive groups. Never build a 1-item media group.
+- **Never blind-retry an ambiguous Telegram send.** A send that fails with a
+  *post-send client timeout* may still be delivered — Telegram answers only
+  after its server-side work (URL fetches, album processing) finishes.
+  `sender.rs::may_have_landed` surfaces such failures instead of retrying or
+  falling back to another delivery route: a duplicated album is worse than one
+  failure notice. Only provably-not-posted errors (flood-wait, connect-phase)
+  get the one-shot retry. Keep `TG_SEND_TIMEOUT_SECS` generous — a short client
+  timeout manufactures phantom "couldn't send" failures for sends that landed.
 - **Bot API upload cap is 50 MB.** Oversize media → reply with link + note.
 - **`panic = "abort"` in release** → panics can't be caught; they abort the
   process. Prevent them: no `unwrap()`/`expect()` on runtime-fallible paths, and

@@ -55,6 +55,12 @@ pub struct Config {
     pub max_upload_bytes: u64,
     pub queue_capacity: usize,
     pub job_timeout: Duration,
+    /// Per-request timeout for Telegram Bot API calls. Must be generous: a
+    /// 10-item `sendMediaGroup` (server-side URL fetches, or a multipart
+    /// upload) can far outlast teloxide's 17 s default, and a client-side
+    /// timeout on a request Telegram then completes anyway produces a phantom
+    /// "couldn't send" failure. Hot-config `TG_SEND_TIMEOUT_SECS`.
+    pub tg_send_timeout: Duration,
     pub request_pacing: Duration,
     /// Periodic liveness/metrics log interval. `None` disables it
     /// (`HEARTBEAT_SECS=0`).
@@ -86,7 +92,11 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_THREADS_SEC_CH_UA.into()),
             max_upload_bytes: parse_u64("MAX_UPLOAD_BYTES", FIFTY_MIB)?,
             queue_capacity: parse_u64("QUEUE_CAPACITY", 16)? as usize,
-            job_timeout: Duration::from_secs(parse_u64("JOB_TIMEOUT_SECS", 90)?),
+            // Must comfortably exceed a full delivery (extraction + downloads
+            // + several album sends) — expiring mid-send cancels a request
+            // Telegram may still complete (the phantom-failure problem).
+            job_timeout: Duration::from_secs(parse_u64("JOB_TIMEOUT_SECS", 300)?),
+            tg_send_timeout: Duration::from_secs(parse_u64("TG_SEND_TIMEOUT_SECS", 120)?),
             request_pacing: Duration::from_millis(parse_u64("REQUEST_PACING_MS", 1500)?),
             heartbeat: heartbeat_from_secs(parse_u64("HEARTBEAT_SECS", 3600)?),
         })
@@ -101,12 +111,13 @@ impl Config {
     /// booleans for those (see `summary_omits_secrets` test).
     pub fn summary(&self) -> String {
         format!(
-            "allowed_chats={} queue_cap={} cache_ttl={}s job_timeout={}s pacing={}ms \
+            "allowed_chats={} queue_cap={} cache_ttl={}s job_timeout={}s send_timeout={}s pacing={}ms \
 max_upload={}MB cookies={} fallback={} threads={} jina_key={} heartbeat={} embed_ua={:?}",
             self.allowed_chats.len(),
             self.queue_capacity,
             self.cache_ttl.as_secs(),
             self.job_timeout.as_secs(),
+            self.tg_send_timeout.as_secs(),
             self.request_pacing.as_millis(),
             self.max_upload_bytes / (1024 * 1024),
             self.ig_cookies_path.is_some(),
@@ -232,7 +243,8 @@ mod tests {
             threads_sec_ch_ua: "th-ch".into(),
             max_upload_bytes: FIFTY_MIB,
             queue_capacity: 16,
-            job_timeout: Duration::from_secs(90),
+            job_timeout: Duration::from_secs(300),
+            tg_send_timeout: Duration::from_secs(120),
             request_pacing: Duration::from_millis(1500),
             heartbeat: Some(Duration::from_secs(3600)),
         }

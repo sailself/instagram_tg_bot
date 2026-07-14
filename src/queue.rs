@@ -70,16 +70,10 @@ pub async fn run_worker(
     tracing::info!("worker started (concurrency = 1)");
     while let Some(job) = rx.recv().await {
         let seq = metrics.record_received();
-        // One span per job: every downstream line is tagged with
-        // seq/platform/shortcode/chat automatically, so a post's whole lifecycle
-        // is greppable.
-        let span = tracing::info_span!(
-            "job",
-            seq,
-            platform = ?job.platform,
-            shortcode = %job.shortcode,
-            chat = job.chat_id.0
-        );
+        // One span per job: every downstream line is tagged automatically, so
+        // a post's whole lifecycle is greppable. `id` is the namespaced dedup
+        // key (`ig:`/`th:` + shortcode) — platform + shortcode in one field.
+        let span = tracing::info_span!("job", seq, id = %job.dedup_key(), chat = job.chat_id.0);
         process_job(&bot, &chains, &http, &cfg, &dedup, &metrics, &job)
             .instrument(span)
             .await;

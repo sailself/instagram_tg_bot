@@ -8,6 +8,7 @@ mod extract;
 mod media;
 mod metrics;
 mod queue;
+mod threads_share;
 mod urls;
 
 use anyhow::Result;
@@ -58,12 +59,16 @@ async fn main() -> Result<()> {
 
     // Bounded queue → single worker (concurrency = 1). The worker routes each
     // job to the Instagram or Threads chain by platform.
-    let (tx, rx) = tokio::sync::mpsc::channel::<queue::Job>(cfg.queue_capacity);
+    let (tx, rx) = tokio::sync::mpsc::channel::<queue::QueuedJob>(cfg.queue_capacity);
     {
         let bot = tgbot.clone();
         let chains = queue::Chains {
             instagram: Arc::new(extract::build_ig_chain(&cfg, http.clone())),
             threads: Arc::new(extract::build_threads_chain(&cfg, http.clone())),
+            threads_share: Arc::new(threads_share::ThreadsShareResolver::new(
+                cfg.threads_user_agent.clone(),
+                cfg.threads_sec_ch_ua.clone(),
+            )?),
         };
         let cfg = cfg.clone();
         let http = http.clone();
@@ -131,7 +136,12 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     // journald, log files, and consoles without VT processing (terminal
     // detection can't see those). Colors are opt-in via LOG_ANSI=1.
     let ansi = std::env::var("LOG_ANSI")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false);
     let stdout_layer = fmt::layer().compact().with_target(false).with_ansi(ansi);
 

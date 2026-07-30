@@ -8,7 +8,7 @@ Guidance for any AI agent (Claude Code, Codex, etc.) working in this repo.
 A Rust Telegram bot that mirrors **Instagram** *and* **Threads** posts into a
 Telegram group: it watches the chat, and when a member posts an instagram.com
 link (`/p/`, `/reel/`, `/tv/`) or a threads.com / threads.net link
-(`/@user/post/…`) it replies with the post's media (images/videos, including
+(`/@user/post/…` or `/share/…`) it replies with the post's media (images/videos, including
 carousels), caption, and author — and, for Threads' text-first posts, the text
 itself when there's no media. Free to run; targets an **OCI Always Free 1 OCPU /
 1 GB** VM. Long polling, **cookieless-first**.
@@ -36,8 +36,10 @@ output before claiming anything works.
 ```
 teloxide long-poll dispatcher
   → handler.rs: chat allowlist + scan text/entities for IG/Threads links
-       (find_links → Platform-tagged) → namespaced dedup claim (ig:/th:)
+       (find_links → Platform-tagged target) → namespaced ingress dedup claim
   → bounded mpsc → SINGLE worker (concurrency = 1)
+  → Threads /share aliases: validate redirects → canonical /@user/post/code
+       → claim canonical th: key (alias uses th-share:)
   → route by Platform (queue.rs `Chains`) to the matching ExtractorChain:
        IG:      embed → yt-dlp (+ gallery-dl if cookies) (+ external if configured)
        Threads: threads-json → threads-embed   (accept_textonly = true)
@@ -107,7 +109,9 @@ only (`threads_json` primary, `threads_embed` the `/embed`-HTML fallback).
   enqueued). Only a *successfully delivered* post stays deduped for the TTL. Keys
   are **namespaced per platform** (`Platform::dedup_key` → `ig:`/`th:`) — IG and
   Threads shortcodes share an alphabet and would otherwise collide across
-  platforms.
+  platforms. Threads share aliases first claim `th-share:<token>`; after a safe
+  redirect resolution they also claim `th:<post-code>`. A successful delivery
+  retains both claims; failures release every claim owned by the job.
 
 ## Conventions
 
@@ -136,7 +140,8 @@ backends need **live validation against real Instagram posts**, and the
 **Threads** scraper (the working header set, repost/quote JSON nesting,
 poll-option visibility, age-gated/private behavior) needs **live validation
 against real Threads posts** — unit tests cover parsing of captured/representative
-payloads, not live behavior.
+payloads, not live behavior. Threads `/share/` redirect resolution likewise needs
+a live probe in addition to its offline redirect-state tests.
 
 ## Agent Execution Logging
 

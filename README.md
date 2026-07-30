@@ -5,7 +5,7 @@
 
 A Rust Telegram bot that watches a group chat and, whenever someone posts an
 **Instagram** link (post `/p/`, reel `/reel/`, `/tv/`) or a **Threads** link
-(`threads.com` / `threads.net` `/@user/post/…`), replies to that message with the
+(`threads.com` / `threads.net` `/@user/post/…` or `/share/…`), replies to that message with the
 post's **media (images/videos, incl. carousels), caption, and author** — and, for
 Threads' text-first posts, the **text** itself when there's no media. Free to
 run; designed for an **OCI Always Free 1 OCPU / 1 GB** VM.
@@ -13,13 +13,17 @@ run; designed for an **OCI Always Free 1 OCPU / 1 GB** VM.
 ## How it works
 
 ```
-group msg ─(teloxide, long-poll)→ detect IG / Threads link → route by host
-        → dedup → bounded queue → single worker → per-platform extractor chain
+group msg ─(teloxide, long-poll)→ detect IG / Threads link → ingress dedup
+        → bounded queue → single worker → resolve Threads /share alias → route by host
+        → canonical dedup → per-platform extractor chain
         → reply (album / photo / video / text)
 ```
 
 Links are routed by **host** (never by shortcode — IG and Threads share the same
 code alphabet), and dedup keys are namespaced per platform (`ig:` / `th:`).
+Threads `/share/<token>` aliases are resolved to their clean canonical
+`/@user/post/<code>` permalink inside the single worker before extraction. The
+alias and canonical post are both deduplicated after a successful delivery.
 
 **Instagram chain** (first backend that returns media wins):
 

@@ -4,7 +4,7 @@
 use crate::bot::TgBot;
 use crate::config::Config;
 use crate::dedup::Dedup;
-use crate::queue::Job;
+use crate::queue::QueuedJob;
 use crate::urls::{self, Platform};
 use std::sync::Arc;
 use teloxide::prelude::*;
@@ -15,7 +15,7 @@ pub async fn on_message(
     bot: TgBot,
     msg: Message,
     cfg: Arc<Config>,
-    tx: Sender<Job>,
+    tx: Sender<QueuedJob>,
     dedup: Dedup,
 ) -> ResponseResult<()> {
     if !cfg.chat_allowed(msg.chat.id.0) {
@@ -37,27 +37,26 @@ pub async fn on_message(
     for link in links {
         // Threads support is a config-gated kill-switch; Instagram is always on.
         if link.platform == Platform::Threads && !cfg.threads_enabled {
-            tracing::debug!(shortcode = %link.shortcode, "threads disabled, skipping link");
+            tracing::debug!(id = %link.target.id(), "threads disabled, skipping link");
             continue;
         }
-        let dedup_key = link.platform.dedup_key(&link.shortcode);
+        let dedup_key = link.dedup_key();
         if dedup.seen_or_claim(&dedup_key).await {
             tracing::debug!(key = %dedup_key, "duplicate within TTL, skipping");
             continue;
         }
         tracing::info!(
             platform = ?link.platform,
-            shortcode = %link.shortcode,
+            id = %link.target.id(),
             chat = msg.chat.id.0,
             user = poster.as_deref().unwrap_or("?"),
             "link detected"
         );
-        let job = Job {
+        let job = QueuedJob {
             chat_id: msg.chat.id,
             reply_to: msg.id,
             platform: link.platform,
-            original_url: link.canonical_url,
-            shortcode: link.shortcode,
+            target: link.target,
         };
         match tx.try_send(job) {
             Ok(()) => {}
@@ -65,7 +64,10 @@ pub async fn on_message(
             Err(TrySendError::Full(job)) => {
                 dedup.forget(&job.dedup_key()).await;
                 let _ = bot
-                    .send_message(msg.chat.id, "🐢 Busy right now — try that link again in a moment.")
+                    .send_message(
+                        msg.chat.id,
+                        "🐢 Busy right now — try that link again in a moment.",
+                    )
                     .reply_parameters(ReplyParameters::new(msg.id))
                     .await;
             }
@@ -90,7 +92,10 @@ fn collect_text(msg: &Message) -> String {
         out.push_str(c);
         out.push(' ');
     }
-    for ents in [msg.entities(), msg.caption_entities()].into_iter().flatten() {
+    for ents in [msg.entities(), msg.caption_entities()]
+        .into_iter()
+        .flatten()
+    {
         for e in ents {
             if let MessageEntityKind::TextLink { url } = &e.kind {
                 out.push_str(url.as_str());

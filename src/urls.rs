@@ -49,13 +49,68 @@ impl Platform {
     }
 }
 
-/// A detected post link: the platform, the canonical URL the backends fetch and
-/// the caption links to, and the shortcode (dedup id + JSON match key).
+/// The upstream resource identified by a detected link. Direct post links are
+/// immediately canonical; Threads share aliases must be resolved by the worker
+/// before extraction because their token is not the post shortcode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkTarget {
+    Post {
+        canonical_url: String,
+        shortcode: String,
+    },
+    ThreadsShare {
+        share_url: String,
+        token: String,
+    },
+}
+
+impl LinkTarget {
+    pub fn url(&self) -> &str {
+        match self {
+            Self::Post { canonical_url, .. } => canonical_url,
+            Self::ThreadsShare { share_url, .. } => share_url,
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Post { shortcode, .. } => shortcode,
+            Self::ThreadsShare { token, .. } => token,
+        }
+    }
+
+    pub fn dedup_key(&self, platform: Platform) -> String {
+        match self {
+            Self::Post { shortcode, .. } => platform.dedup_key(shortcode),
+            Self::ThreadsShare { token, .. } => format!("th-share:{token}"),
+        }
+    }
+
+    fn same_identity(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (
+                Self::Post { shortcode: left, .. },
+                Self::Post { shortcode: right, .. }
+            ) | (
+                Self::ThreadsShare { token: left, .. },
+                Self::ThreadsShare { token: right, .. }
+            ) if left == right
+        )
+    }
+}
+
+/// A detected Instagram or Threads link and the target it identifies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectedLink {
     pub platform: Platform,
-    pub canonical_url: String,
-    pub shortcode: String,
+    pub target: LinkTarget,
+}
+
+impl DetectedLink {
+    pub fn dedup_key(&self) -> String {
+        self.target.dedup_key(self.platform)
+    }
 }
 
 /// Matches instagram.com / instagr.am post / reel / tv links, with an optional
@@ -71,11 +126,18 @@ static IG_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// capturing the username (1) and the shortcode (2). Trailing `/embed`, query
 /// (`?xmt=…`), and fragment stop at the shortcode class, so the canonical URL is
 /// rebuilt clean (tracking params dropped) from the two captures.
-static THREADS_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
+static THREADS_POST_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)https?://(?:www\.)?threads\.(?:com|net)/@([A-Za-z0-9_.]+)/post/([A-Za-z0-9_-]+)",
     )
     .expect("valid Threads url regex")
+});
+
+/// Matches Threads share aliases `/share/<TOKEN>`. The token only identifies
+/// the redirect alias; the worker resolves it to the real post shortcode.
+static THREADS_SHARE_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)https?://(?:www\.)?threads\.(com|net)/share/([A-Za-z0-9_-]+)")
+        .expect("valid Threads share url regex")
 });
 
 /// Find all Instagram + Threads post links in a blob of text, de-duplicated by
@@ -84,12 +146,12 @@ static THREADS_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
 pub fn find_links(text: &str) -> Vec<DetectedLink> {
     let mut out: Vec<DetectedLink> = Vec::new();
     let mut push = |link: DetectedLink| {
-        if link.shortcode.is_empty() {
+        if link.target.id().is_empty() {
             return;
         }
         if out
             .iter()
-            .any(|l| l.platform == link.platform && l.shortcode == link.shortcode)
+            .any(|l| l.platform == link.platform && l.target.same_identity(&link.target))
         {
             return;
         }
@@ -97,23 +159,59 @@ pub fn find_links(text: &str) -> Vec<DetectedLink> {
     };
 
     for caps in IG_URL_RE.captures_iter(text) {
-        let shortcode = caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+        let shortcode = caps
+            .get(1)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
         push(DetectedLink {
             platform: Platform::Instagram,
-            canonical_url: post_url(&shortcode),
-            shortcode,
+            target: LinkTarget::Post {
+                canonical_url: post_url(&shortcode),
+                shortcode,
+            },
         });
     }
-    for caps in THREADS_URL_RE.captures_iter(text) {
+    for caps in THREADS_POST_URL_RE.captures_iter(text) {
         let user = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-        let shortcode = caps.get(2).map(|m| m.as_str().to_string()).unwrap_or_default();
+        let shortcode = caps
+            .get(2)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
         push(DetectedLink {
             platform: Platform::Threads,
-            canonical_url: threads_post_url(user, &shortcode),
-            shortcode,
+            target: LinkTarget::Post {
+                canonical_url: threads_post_url(user, &shortcode),
+                shortcode,
+            },
+        });
+    }
+    for caps in THREADS_SHARE_URL_RE.captures_iter(text) {
+        let Some(full_match) = caps.get(0) else {
+            continue;
+        };
+        if !has_share_url_boundary(text, full_match.end()) {
+            continue;
+        }
+        let domain = caps.get(1).map(|m| m.as_str()).unwrap_or("com");
+        let token = caps
+            .get(2)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+        push(DetectedLink {
+            platform: Platform::Threads,
+            target: LinkTarget::ThreadsShare {
+                share_url: threads_share_url(domain, &token),
+                token,
+            },
         });
     }
     out
+}
+
+fn has_share_url_boundary(text: &str, match_end: usize) -> bool {
+    text.get(match_end..)
+        .and_then(|tail| tail.chars().next())
+        .is_none_or(|next| next.is_whitespace() || matches!(next, '/' | '?' | '#'))
 }
 
 /// Canonical Instagram post URL — fetched by the embed scraper (with a crawler
@@ -129,23 +227,38 @@ pub fn threads_post_url(username: &str, shortcode: &str) -> String {
     format!("https://www.threads.com/@{username}/post/{shortcode}")
 }
 
+/// Normalized Threads share URL. Keep the legacy domain when supplied so the
+/// resolver safely handles its extra redirect hop.
+pub fn threads_share_url(domain: &str, token: &str) -> String {
+    format!("https://www.threads.{domain}/share/{token}/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn codes(text: &str) -> Vec<String> {
-        find_links(text).into_iter().map(|l| l.shortcode).collect()
+        find_links(text)
+            .into_iter()
+            .map(|l| l.target.id().to_string())
+            .collect()
     }
 
     fn pairs(text: &str) -> Vec<(Platform, String)> {
-        find_links(text).into_iter().map(|l| (l.platform, l.shortcode)).collect()
+        find_links(text)
+            .into_iter()
+            .map(|l| (l.platform, l.target.id().to_string()))
+            .collect()
     }
 
     // --- Instagram detection (unchanged behavior) ---
 
     #[test]
     fn plain_post() {
-        assert_eq!(codes("look https://www.instagram.com/p/ABC123/ nice"), vec!["ABC123"]);
+        assert_eq!(
+            codes("look https://www.instagram.com/p/ABC123/ nice"),
+            vec!["ABC123"]
+        );
     }
 
     #[test]
@@ -158,7 +271,10 @@ mod tests {
 
     #[test]
     fn username_segment() {
-        assert_eq!(codes("https://www.instagram.com/nasa/p/C-a6bDVy7hz/"), vec!["C-a6bDVy7hz"]);
+        assert_eq!(
+            codes("https://www.instagram.com/nasa/p/C-a6bDVy7hz/"),
+            vec!["C-a6bDVy7hz"]
+        );
     }
 
     #[test]
@@ -204,8 +320,72 @@ mod tests {
         let links = find_links("see https://www.threads.com/@zuck/post/C7UV9BwJ8qq nice");
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].platform, Platform::Threads);
-        assert_eq!(links[0].shortcode, "C7UV9BwJ8qq");
-        assert_eq!(links[0].canonical_url, "https://www.threads.com/@zuck/post/C7UV9BwJ8qq");
+        assert_eq!(links[0].target.id(), "C7UV9BwJ8qq");
+        assert_eq!(
+            links[0].target.url(),
+            "https://www.threads.com/@zuck/post/C7UV9BwJ8qq"
+        );
+    }
+
+    #[test]
+    fn threads_com_share_alias_is_detected() {
+        let links = find_links("see https://www.threads.com/share/BAaEtHuRGL/ nice");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].platform, Platform::Threads);
+        assert_eq!(
+            links[0].target,
+            LinkTarget::ThreadsShare {
+                share_url: "https://www.threads.com/share/BAaEtHuRGL/".into(),
+                token: "BAaEtHuRGL".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn threads_net_share_alias_keeps_legacy_host_for_resolution() {
+        let links = find_links("https://threads.net/share/Legacy_1-2/");
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].target.url(),
+            "https://www.threads.net/share/Legacy_1-2/"
+        );
+        assert_eq!(links[0].dedup_key(), "th-share:Legacy_1-2");
+    }
+
+    #[test]
+    fn threads_share_strips_query_and_fragment() {
+        let links = find_links("https://www.threads.com/share/Token_9/?xmt=secret#fragment");
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].target.url(),
+            "https://www.threads.com/share/Token_9/"
+        );
+    }
+
+    #[test]
+    fn threads_share_aliases_dedup_by_token_across_domains() {
+        let links = find_links(
+            "https://threads.net/share/SAME/ https://www.threads.com/share/SAME/?xmt=tracking",
+        );
+        assert_eq!(links.len(), 1);
+        assert!(matches!(links[0].target, LinkTarget::ThreadsShare { .. }));
+    }
+
+    #[test]
+    fn threads_share_ignores_missing_token_and_unrelated_paths() {
+        assert!(find_links("https://www.threads.com/share/").is_empty());
+        assert!(find_links("https://www.threads.com/shared/ABC").is_empty());
+        assert!(find_links("https://www.threads.com/share/BAD.token").is_empty());
+        assert!(find_links("https://example.com/share/ABC").is_empty());
+    }
+
+    #[test]
+    fn share_and_post_with_same_id_have_distinct_ingress_keys() {
+        let links =
+            find_links("https://www.threads.com/@u/post/SAME https://www.threads.com/share/SAME/");
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].dedup_key(), "th:SAME");
+        assert_eq!(links[1].dedup_key(), "th-share:SAME");
     }
 
     #[test]
@@ -213,17 +393,23 @@ mod tests {
         let links = find_links("https://threads.net/@user.name/post/DAELxBhOoWc");
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].platform, Platform::Threads);
-        assert_eq!(links[0].shortcode, "DAELxBhOoWc");
+        assert_eq!(links[0].target.id(), "DAELxBhOoWc");
         // Canonicalized to the current primary domain regardless of input host.
-        assert_eq!(links[0].canonical_url, "https://www.threads.com/@user.name/post/DAELxBhOoWc");
+        assert_eq!(
+            links[0].target.url(),
+            "https://www.threads.com/@user.name/post/DAELxBhOoWc"
+        );
     }
 
     #[test]
     fn threads_strips_tracking_and_embed_suffix() {
         // /embed suffix and the ?xmt= share tracker must not leak into the code.
         let links = find_links("https://www.threads.com/@a/post/AbC-1_d/embed?xmt=TOKEN&igshid=z");
-        assert_eq!(links[0].shortcode, "AbC-1_d");
-        assert_eq!(links[0].canonical_url, "https://www.threads.com/@a/post/AbC-1_d");
+        assert_eq!(links[0].target.id(), "AbC-1_d");
+        assert_eq!(
+            links[0].target.url(),
+            "https://www.threads.com/@a/post/AbC-1_d"
+        );
     }
 
     #[test]
@@ -240,7 +426,10 @@ mod tests {
 
     #[test]
     fn threads_builds_canonical_url() {
-        assert_eq!(threads_post_url("nasa", "ABC"), "https://www.threads.com/@nasa/post/ABC");
+        assert_eq!(
+            threads_post_url("nasa", "ABC"),
+            "https://www.threads.com/@nasa/post/ABC"
+        );
     }
 
     // --- Cross-platform: same shortcode on both must NOT collide ---
@@ -258,6 +447,9 @@ mod tests {
     fn dedup_keys_are_namespaced_per_platform() {
         assert_eq!(Platform::Instagram.dedup_key("SAME"), "ig:SAME");
         assert_eq!(Platform::Threads.dedup_key("SAME"), "th:SAME");
-        assert_ne!(Platform::Instagram.dedup_key("SAME"), Platform::Threads.dedup_key("SAME"));
+        assert_ne!(
+            Platform::Instagram.dedup_key("SAME"),
+            Platform::Threads.dedup_key("SAME")
+        );
     }
 }

@@ -21,15 +21,9 @@ echo "[2/7] yt-dlp standalone binary + gallery-dl (image stories need it)"
 curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
 chmod a+rx /usr/local/bin/yt-dlp
 /usr/local/bin/yt-dlp --version
-# gallery-dl publishes no standalone Linux binary on its releases page, so it
-# gets its own venv (works on 22.04 and on PEP 668 "externally managed" 24.04).
-# yt-dlp's Instagram story extractor is video-only; gallery-dl is the backend
-# that fetches *image* stories once IG_COOKIES_PATH is set.
-apt-get install -y python3-venv
-python3 -m venv /opt/gallery-dl
-/opt/gallery-dl/bin/pip install --quiet --upgrade pip gallery-dl
-ln -sf /opt/gallery-dl/bin/gallery-dl /usr/local/bin/gallery-dl
-/usr/local/bin/gallery-dl --version
+# gallery-dl (image stories; yt-dlp's story extractor is video-only) — shared
+# with the standalone one-time script so the two can't drift.
+bash "$(dirname "$0")/install-gallery-dl.sh"
 
 echo "[3/7] 2 GB swap + swappiness=10"
 if ! swapon --show | grep -q '/swapfile'; then

@@ -149,19 +149,36 @@ are required. Memory is guarded by `MemoryMax=800M` + single-worker concurrency.
 
 ## Upgrading to a new release
 
-It's a **binary swap** — no new system deps, and new config ships with working
-defaults, so `igbot.env` usually needs no changes. One exception for **v0.3.0**:
-if your `igbot.env` pins `JOB_TIMEOUT_SECS=90`, remove the line (or raise it) —
-the default is now 300 s so multi-album deliveries aren't cut off mid-send.
-One exception for **v0.4.0**: Instagram **Stories** need `gallery-dl` on the box
-(yt-dlp alone only covers *video* stories), and `deploy/setup.sh` installs it on
-fresh setups only. On an existing VM, run the gallery-dl lines from step 2 of
-`deploy/setup.sh` once (a venv at `/opt/gallery-dl`, symlinked into
-`/usr/local/bin`), then copy the updated `deploy/yt-dlp-update.service` into
-`/etc/systemd/system/` and `systemctl daemon-reload`. Stories also need cookies
-(see [Cookies](#cookies-optional--instagram-stories--gallery-dl)); without
-either, posts and Threads keep working exactly as before.
-Replace `v0.4.0` below with the tag you're moving to.
+From your repo checkout on the VM, run the upgrade script. It resolves the
+newest release (or the tag you name), downloads and **verifies the checksum**
+in a private temp dir — so your current directory never matters — skips if
+you're already on that release, swaps the binary, and **rolls back
+automatically** if the new one doesn't come up within ~20 s:
+
+```bash
+cd ~/instagram_tg_bot && git pull
+sudo bash deploy/upgrade.sh              # newest release
+sudo bash deploy/upgrade.sh v0.4.0       # pin a tag — also how you roll back
+sudo bash deploy/upgrade.sh --dry-run    # resolve + download + verify + compare only
+```
+
+A release is a **binary swap** — no new system deps, and new config ships with
+working defaults, so `igbot.env` usually needs no changes. Two exceptions:
+
+- **v0.3.0**: if your `igbot.env` pins `JOB_TIMEOUT_SECS=90`, remove the line
+  (or raise it) — the default is now 300 s so multi-album deliveries aren't cut
+  off mid-send.
+- **v0.4.0**: Instagram **Stories** need `gallery-dl` on the box (yt-dlp alone
+  only covers *video* stories). Fresh installs get it from `setup.sh`; on a VM
+  set up earlier, run **`sudo bash deploy/install-gallery-dl.sh`** once — it
+  installs gallery-dl into a venv at `/opt/gallery-dl`, symlinks it into
+  `/usr/local/bin`, and refreshes the daily updater unit. Idempotent: re-running
+  it just upgrades gallery-dl. Stories also need cookies (see
+  [Cookies](#cookies-optional--instagram-stories--gallery-dl)); without either,
+  posts and Threads keep working exactly as before.
+
+**Manual equivalent** of the script, if you'd rather see each step (replace
+`v0.4.0` with the tag you're moving to):
 
 ```bash
 # 1. download + verify the new release
@@ -169,7 +186,7 @@ cd /tmp
 base=igbot-v0.4.0-linux-x86_64.tar.gz
 url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.0
 curl -L -O "$url/$base" && curl -L -O "$url/$base.sha256"
-sha256sum -c "$base.sha256" && tar -xzf "$base"   # → /tmp/igbot
+sha256sum -c "$base.sha256" && tar -xzf "$base" -C /tmp   # → /tmp/igbot
 
 # 2. back up the current binary (for instant rollback)
 sudo cp -a /opt/igbot/igbot /opt/igbot/igbot.bak
@@ -191,7 +208,9 @@ summary line). From v0.4.0 it also logs `yt-dlp found`, and `gallery-dl found`
 once cookies are set — a `not runnable` WARN there means a backend is missing.
 Then post a real link in your group to confirm.
 
-**Rollback** if anything looks wrong:
+**Rollback** if anything looks wrong: `upgrade.sh` already reverts on its own
+when the new binary fails to start, and `sudo bash deploy/upgrade.sh <previous
+tag>` reinstalls any older release. By hand:
 
 ```bash
 sudo systemctl stop igbot

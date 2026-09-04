@@ -165,7 +165,11 @@ file must be **readable and writable by `botuser`**, so it lives under
 `/opt/igbot/` (the unit's `ReadWritePaths`), never `/etc/igbot/`: yt-dlp
 rewrites the jar on exit and exits non-zero when it can't, which the extractor
 reads as a failed run. Threads never consumes cookies — the file only feeds the
-Instagram chains.
+Instagram chains. Upgrades go through `deploy/upgrade.sh [TAG]` (resolve →
+verify checksum → byte-compare → swap → health-check → auto-rollback); the
+one-time gallery-dl setup for boxes older than v0.4.0 is
+`deploy/install-gallery-dl.sh` (idempotent; `setup.sh` calls it on fresh
+installs).
 
 ## Verification before "done"
 

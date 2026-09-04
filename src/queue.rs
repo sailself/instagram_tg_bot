@@ -281,8 +281,10 @@ async fn resolve_job(
 }
 
 /// Cap the media of a story job at `cap` items (highlights can hold 100; one
-/// album is 10). Returns `(kept, total)` when truncated, and appends a note to
-/// the caption so the viewer knows the mirror is partial. `None` cap = no limit.
+/// album is 10). Returns `(kept, total)` when truncated, and prepends a note to
+/// the caption so the viewer knows the mirror is partial. The note goes *first*
+/// because `sender.rs` drops whatever overflows the last caption — a note at
+/// the tail of a long caption would be the first thing cut. `None` cap = no limit.
 fn cap_story_media(post: &mut Post, cap: Option<usize>) -> Option<(usize, usize)> {
     let cap = cap?;
     let total = post.media.len();
@@ -292,7 +294,7 @@ fn cap_story_media(post: &mut Post, cap: Option<usize>) -> Option<(usize, usize)
     post.media.truncate(cap);
     let note = format!("Showing the first {cap} of {total} items.");
     post.caption = Some(match post.caption.take() {
-        Some(c) if !c.trim().is_empty() => format!("{c}\n\n{note}"),
+        Some(c) if !c.trim().is_empty() => format!("{note}\n\n{c}"),
         _ => note,
     });
     Some((cap, total))
@@ -552,7 +554,7 @@ mod story_tests {
         assert_eq!(post.media.len(), 10);
         assert_eq!(
             post.caption.as_deref(),
-            Some("Rare\n\nShowing the first 10 of 25 items.")
+            Some("Showing the first 10 of 25 items.\n\nRare")
         );
     }
 
@@ -563,6 +565,23 @@ mod story_tests {
         assert_eq!(
             post.caption.as_deref(),
             Some("Showing the first 10 of 12 items.")
+        );
+    }
+
+    #[test]
+    fn story_cap_note_survives_caption_truncation() {
+        // A 10-item album gets exactly one 1024-UTF-16 caption; a long story
+        // caption overflows it and the sender drops the tail. The "partial
+        // mirror" note must be in the part that ships, not the part that's cut.
+        let long = "word ".repeat(200);
+        let mut post = post_with(25, Some(&long));
+        assert_eq!(cap_story_media(&mut post, Some(10)), Some((10, 25)));
+        let captions = sender::compose_captions(&post, Platform::Instagram, 1);
+        assert_eq!(captions.len(), 1);
+        assert!(
+            captions[0].contains("Showing the first 10 of 25 items."),
+            "note was truncated away: {:?}",
+            captions[0]
         );
     }
 

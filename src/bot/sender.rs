@@ -398,7 +398,7 @@ pub fn typing_indicator(bot: &TgBot, chat_id: ChatId) -> Keepalive {
 ///
 /// A short caption yields fewer entries than `max_msgs`; the caller leaves the
 /// remaining chunks uncaptioned.
-fn compose_captions(post: &Post, platform: Platform, max_msgs: usize) -> Vec<String> {
+pub(crate) fn compose_captions(post: &Post, platform: Platform, max_msgs: usize) -> Vec<String> {
     let header = post
         .author
         .as_ref()

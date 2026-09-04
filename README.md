@@ -127,12 +127,12 @@ cd instagram_tg_bot
 
 # 2. download + verify the release binary
 cd /tmp
-base=igbot-v0.3.1-linux-x86_64.tar.gz
-url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.3.1
+base=igbot-v0.4.0-linux-x86_64.tar.gz
+url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.0
 curl -L -O "$url/$base" && curl -L -O "$url/$base.sha256"
 sha256sum -c "$base.sha256" && tar -xzf "$base"   # → /tmp/igbot
 
-# 3. install (ffmpeg, yt-dlp, 2 GB swap, service user, systemd units)
+# 3. install (ffmpeg, yt-dlp, gallery-dl, 2 GB swap, service user, systemd units)
 cd ~/instagram_tg_bot
 sudo bash deploy/setup.sh /tmp/igbot
 
@@ -153,13 +153,21 @@ It's a **binary swap** — no new system deps, and new config ships with working
 defaults, so `igbot.env` usually needs no changes. One exception for **v0.3.0**:
 if your `igbot.env` pins `JOB_TIMEOUT_SECS=90`, remove the line (or raise it) —
 the default is now 300 s so multi-album deliveries aren't cut off mid-send.
-Replace `v0.3.1` below with the tag you're moving to.
+One exception for **v0.4.0**: Instagram **Stories** need `gallery-dl` on the box
+(yt-dlp alone only covers *video* stories), and `deploy/setup.sh` installs it on
+fresh setups only. On an existing VM, run the gallery-dl lines from step 2 of
+`deploy/setup.sh` once (a venv at `/opt/gallery-dl`, symlinked into
+`/usr/local/bin`), then copy the updated `deploy/yt-dlp-update.service` into
+`/etc/systemd/system/` and `systemctl daemon-reload`. Stories also need cookies
+(see [Cookies](#cookies-optional--instagram-stories--gallery-dl)); without
+either, posts and Threads keep working exactly as before.
+Replace `v0.4.0` below with the tag you're moving to.
 
 ```bash
 # 1. download + verify the new release
 cd /tmp
-base=igbot-v0.3.1-linux-x86_64.tar.gz
-url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.3.1
+base=igbot-v0.4.0-linux-x86_64.tar.gz
+url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.0
 curl -L -O "$url/$base" && curl -L -O "$url/$base.sha256"
 sha256sum -c "$base.sha256" && tar -xzf "$base"   # → /tmp/igbot
 
@@ -179,7 +187,9 @@ journalctl -u igbot -n 50 --no-pager | grep -Ei 'config loaded|extractor chain'
 
 A successful upgrade logs both `instagram extractor chain built` and
 `threads extractor chain built` at startup (and `threads=true` in the config
-summary line). Then post a real link in your group to confirm.
+summary line). From v0.4.0 it also logs `yt-dlp found`, and `gallery-dl found`
+once cookies are set — a `not runnable` WARN there means a backend is missing.
+Then post a real link in your group to confirm.
 
 **Rollback** if anything looks wrong:
 

@@ -64,6 +64,8 @@ async fn main() -> Result<()> {
         let bot = tgbot.clone();
         let chains = queue::Chains {
             instagram: Arc::new(extract::build_ig_chain(&cfg, http.clone())),
+            // Stories are login-walled: this chain exists only with cookies.
+            instagram_story: extract::build_ig_story_chain(&cfg).map(Arc::new),
             threads: Arc::new(extract::build_threads_chain(&cfg, http.clone())),
             threads_share: Arc::new(threads_share::ThreadsShareResolver::new(
                 cfg.threads_user_agent.clone(),

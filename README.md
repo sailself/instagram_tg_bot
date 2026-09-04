@@ -4,7 +4,8 @@
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/sailself/instagram_tg_bot)
 
 A Rust Telegram bot that watches a group chat and, whenever someone posts an
-**Instagram** link (post `/p/`, reel `/reel/`, `/tv/`) or a **Threads** link
+**Instagram** link (post `/p/`, reel `/reel/`, `/tv/`, or a **story** /
+highlight `/stories/…` — stories need a login, see below) or a **Threads** link
 (`threads.com` / `threads.net` `/@user/post/…` or `/share/…`), replies to that message with the
 post's **media (images/videos, incl. carousels), caption, and author** — and, for
 Threads' text-first posts, the **text** itself when there's no media. Free to
@@ -13,17 +14,24 @@ run; designed for an **OCI Always Free 1 OCPU / 1 GB** VM.
 ## How it works
 
 ```
-group msg ─(teloxide, long-poll)→ detect IG / Threads link → ingress dedup
-        → bounded queue → single worker → resolve Threads /share alias → route by host
-        → canonical dedup → per-platform extractor chain
+group msg ─(teloxide, long-poll)→ skip the bot's own (forwarded) messages
+        → detect IG / Threads link → ingress dedup
+        → bounded queue → single worker → resolve Threads /share alias
+        → route by host (+ post vs story) → canonical dedup → extractor chain
         → reply (album / photo / video / text)
 ```
 
 Links are routed by **host** (never by shortcode — IG and Threads share the same
-code alphabet), and dedup keys are namespaced per platform (`ig:` / `th:`).
-Threads `/share/<token>` aliases are resolved to their clean canonical
-`/@user/post/<code>` permalink inside the single worker before extraction. The
-alias and canonical post are both deduplicated after a successful delivery.
+code alphabet), and dedup keys are namespaced per platform and kind (`ig:` /
+`ig-story:` / `th:`). Threads `/share/<token>` aliases are resolved to their
+clean canonical `/@user/post/<code>` permalink inside the single worker before
+extraction. The alias and canonical post are both deduplicated after a
+successful delivery.
+
+The bot's replies end with a `🔗 <link>` footer. A message the bot itself
+authored — typically one of its replies **forwarded** from another chat — is
+ignored, so the bot never mirrors its own mirror. (Only *this* bot is filtered;
+forwards from other users and bots are processed normally.)
 
 **Instagram chain** (first backend that returns media wins):
 
@@ -37,6 +45,15 @@ alias and canonical post are both deduplicated after a successful delivery.
 3. **gallery-dl** — *only if* `IG_COOKIES_PATH` is set (images/carousels).
 4. **external fallback** — *only if* `FALLBACK_PROVIDER` is set (Jina / EmbedEZ);
    fetches from a different IP when ours is blocked. Off by default.
+
+**Instagram story chain** (`/stories/<user>/<id>/` items and
+`/stories/highlights/<id>/`): Instagram serves stories **only to logged-in
+sessions** — anonymously, the story page is a login wall (its lone `og:image`
+is the profile picture). So this chain is **gallery-dl → yt-dlp**, both with
+cookies, and exists **only when `IG_COOKIES_PATH` is set**. Without cookies a
+story link gets a short "needs a login session" reply (or is ignored entirely
+with `IG_STORIES_ENABLED=0`). Highlights are capped at `IG_STORY_MAX_ITEMS`
+(default 10, one album) with a "showing N of M" note.
 
 **Threads chain** (neither yt-dlp nor gallery-dl supports Threads, so it's
 in-process only):
@@ -193,7 +210,9 @@ See [`.env.example`](.env.example) for everything. Key variables:
 | `THREADS_USER_AGENT` / `THREADS_SEC_CH_UA` | desktop-browser UA + matching client-hint for the Threads scrape (hot-config) |
 | `RUST_LOG` | log filter (`igbot=info,warn` default; `igbot=debug` for detail) |
 | `HEARTBEAT_SECS` / `LOG_DIR` / `LOG_MAX_FILES` | metrics heartbeat / optional rotating file logs |
-| `IG_COOKIES_PATH` | enables the gallery-dl + cookie path (use a **burner** only) |
+| `IG_COOKIES_PATH` | enables the gallery-dl + cookie path **and Instagram Stories** (use a **burner** only) |
+| `IG_STORIES_ENABLED` | set `0/false/no/off` to ignore story links instead of replying "needs a login session" (default on) |
+| `IG_STORY_MAX_ITEMS` | max items mirrored per story/highlight link (default 10; `0` = unlimited) |
 | `FALLBACK_PROVIDER` / `JINA_API_KEY` | enables the external fallback (off by default) |
 
 Brittle bits (User-Agent, endpoints, timeouts) are hot-config via env so a break
@@ -209,6 +228,14 @@ is a config change, not a recompile.
   recompile). An empty-shell response is classified as a failure, so users get a
   graceful reply rather than silence. The Threads scrape, repost/quote nesting,
   and poll rendering still want **live validation** against real posts.
+- Instagram **Stories** are login-walled: without `IG_COOKIES_PATH` the bot can
+  only say so. With cookies, the story chain (gallery-dl → yt-dlp) still wants
+  **live validation** — this repo's tests cover routing, parsing, and copy, not a
+  real logged-in fetch. Stories expire after 24 h; an expired item reads as
+  "not found".
+- The self-forward guard keys on Telegram's forward origin. A forward whose
+  origin is hidden (user privacy setting, or a channel the bot posted into) is
+  not attributable to the bot and is processed like any other message.
 - Albums are sent as up to 10 items (Telegram album max); extras are noted.
 - Bot API upload cap is 50 MB; larger videos get a link + note instead.
 - This scrapes public, logged-out content. Adding burner cookies is opt-in and

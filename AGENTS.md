@@ -7,7 +7,8 @@ Guidance for any AI agent (Claude Code, Codex, etc.) working in this repo.
 
 A Rust Telegram bot that mirrors **Instagram** *and* **Threads** posts into a
 Telegram group: it watches the chat, and when a member posts an instagram.com
-link (`/p/`, `/reel/`, `/tv/`) or a threads.com / threads.net link
+link (`/p/`, `/reel/`, `/tv/`, or a login-walled **story** / highlight
+`/stories/…`) or a threads.com / threads.net link
 (`/@user/post/…` or `/share/…`) it replies with the post's media (images/videos, including
 carousels), caption, and author — and, for Threads' text-first posts, the text
 itself when there's no media. Free to run; targets an **OCI Always Free 1 OCPU /
@@ -35,14 +36,18 @@ output before claiming anything works.
 
 ```
 teloxide long-poll dispatcher
-  → handler.rs: chat allowlist + scan text/entities for IG/Threads links
-       (find_links → Platform-tagged target) → namespaced ingress dedup claim
+  → handler.rs: chat allowlist → drop the bot's OWN messages (forward_origin
+       sender == Me, or sender == Me) → scan text/entities for IG/Threads links
+       (find_links → Platform-tagged LinkTarget: Post | Story | ThreadsShare)
+       → namespaced ingress dedup claim
   → bounded mpsc → SINGLE worker (concurrency = 1)
   → Threads /share aliases: validate redirects → canonical /@user/post/code
        → claim canonical th: key (alias uses th-share:)
-  → route by Platform (queue.rs `Chains`) to the matching ExtractorChain:
-       IG:      embed → yt-dlp (+ gallery-dl if cookies) (+ external if configured)
-       Threads: threads-json → threads-embed   (accept_textonly = true)
+  → route by Platform + ContentKind (queue.rs `Chains`) to an ExtractorChain:
+       IG post:  embed → yt-dlp (+ gallery-dl if cookies) (+ external if configured)
+       IG story: gallery-dl → yt-dlp --no-playlist   (ONLY when IG_COOKIES_PATH
+                 is set; otherwise the worker replies "needs a login session")
+       Threads:  threads-json → threads-embed   (accept_textonly = true)
   → sender.rs: captions ≤1024 each, long text continues across the album
        chunks' captions on word boundaries with "…" seam markers (tail past
        the last chunk → dropped, no follow-up) + album chunking +
@@ -99,6 +104,20 @@ only (`threads_json` primary, `threads_embed` the `/embed`-HTML fallback).
   external fallback by default — config-gated (`IG_COOKIES_PATH`,
   `FALLBACK_PROVIDER`). Any cookie use is a disposable burner, never a real
   account.
+- **Instagram Stories are login-walled — the story chain exists only with
+  cookies.** Logged-out, `/stories/…` returns HTTP 200 + a login wall whose lone
+  `og:image` is the **profile picture**. Never put the embed scraper (or any
+  OG-tag fallback) in the story chain — it would ship the avatar as the story.
+  Without `IG_COOKIES_PATH`, `Chains.instagram_story` is `None` and the worker
+  replies with the "needs a login session" notice (never silence, never a
+  doomed subprocess). yt-dlp's story extractor yields **video items only** and
+  expands a story-item URL to the whole tray unless `--no-playlist` is passed;
+  gallery-dl goes first because it also handles image stories.
+- **Never re-parse the bot's own messages.** Replies end with a `🔗 <link>`
+  footer; a member forwarding one into a chat would otherwise make the bot
+  mirror its own mirror. `handler.rs::is_from_self` drops messages whose
+  `forward_origin` sender (or sender) is the bot (`Me`, injected by teloxide's
+  dispatcher). Only *this* bot is filtered — other bots' forwards are fair game.
 - **Memory discipline on 1 GB**: concurrency = 1, capped streaming downloads,
   RAII temp dirs. Don't parallelize extraction or buffer whole files needlessly.
 - **Extraction is fragile by nature.** Every failure path must produce a graceful
@@ -107,9 +126,9 @@ only (`threads_json` primary, `threads_embed` the `/embed`-HTML fallback).
   actionable one.
 - **Dedup semantics**: claim on enqueue, `forget()` on any failure (or if never
   enqueued). Only a *successfully delivered* post stays deduped for the TTL. Keys
-  are **namespaced per platform** (`Platform::dedup_key` → `ig:`/`th:`) — IG and
-  Threads shortcodes share an alphabet and would otherwise collide across
-  platforms. Threads share aliases first claim `th-share:<token>`; after a safe
+  are **namespaced per platform and kind** (`ig:` / `ig-story:` / `th:`) — IG
+  and Threads shortcodes share an alphabet and would otherwise collide across
+  platforms, and numeric story ids are valid shortcode characters too. Threads share aliases first claim `th-share:<token>`; after a safe
   redirect resolution they also claim `th:<post-code>`. A successful delivery
   retains both claims; failures release every claim owned by the job.
 
@@ -141,7 +160,10 @@ backends need **live validation against real Instagram posts**, and the
 poll-option visibility, age-gated/private behavior) needs **live validation
 against real Threads posts** — unit tests cover parsing of captured/representative
 payloads, not live behavior. Threads `/share/` redirect resolution likewise needs
-a live probe in addition to its offline redirect-state tests.
+a live probe in addition to its offline redirect-state tests. The **Instagram
+story chain** can only be exercised live with a burner cookies file
+(`IG_COOKIES_PATH`); offline tests cover story-link detection, routing, the
+no-cookies notice, the highlight cap, and the failure copy.
 
 ## Agent Execution Logging
 

@@ -45,6 +45,13 @@ pub struct Config {
     pub embed_user_agent: String,
     /// Threads support kill-switch (default on). Gates link detection/enqueue.
     pub threads_enabled: bool,
+    /// Instagram Stories kill-switch (default on). Stories are login-walled, so
+    /// without `IG_COOKIES_PATH` a story link gets a "needs a login session"
+    /// notice; set this off to have story links ignored entirely instead.
+    pub ig_stories_enabled: bool,
+    /// Max media items mirrored from one story link (highlights can hold 100).
+    /// `None` = unlimited (`IG_STORY_MAX_ITEMS=0`). Default: one album (10).
+    pub ig_story_max_items: Option<usize>,
     /// UA for the in-process Threads scrape — must be a real desktop-browser UA.
     /// Threads gates its server-rendered post JSON on a coherent browser header
     /// set; a crawler UA returns an empty shell. Hot-config `THREADS_USER_AGENT`.
@@ -87,6 +94,8 @@ impl Config {
             user_agent: opt("USER_AGENT").unwrap_or_else(|| DEFAULT_UA.into()),
             embed_user_agent: opt("EMBED_USER_AGENT").unwrap_or_else(|| DEFAULT_EMBED_UA.into()),
             threads_enabled: parse_bool("THREADS_ENABLED", true),
+            ig_stories_enabled: parse_bool("IG_STORIES_ENABLED", true),
+            ig_story_max_items: story_cap_from(parse_u64("IG_STORY_MAX_ITEMS", 10)?),
             threads_user_agent: opt("THREADS_USER_AGENT").unwrap_or_else(|| DEFAULT_UA.into()),
             threads_sec_ch_ua: opt("THREADS_SEC_CH_UA")
                 .unwrap_or_else(|| DEFAULT_THREADS_SEC_CH_UA.into()),
@@ -112,7 +121,8 @@ impl Config {
     pub fn summary(&self) -> String {
         format!(
             "allowed_chats={} queue_cap={} cache_ttl={}s job_timeout={}s send_timeout={}s pacing={}ms \
-max_upload={}MB cookies={} fallback={} threads={} jina_key={} heartbeat={} embed_ua={:?}",
+max_upload={}MB cookies={} fallback={} threads={} stories={} story_max={} jina_key={} heartbeat={} \
+embed_ua={:?}",
             self.allowed_chats.len(),
             self.queue_capacity,
             self.cache_ttl.as_secs(),
@@ -123,11 +133,48 @@ max_upload={}MB cookies={} fallback={} threads={} jina_key={} heartbeat={} embed
             self.ig_cookies_path.is_some(),
             self.fallback_provider.as_deref().unwrap_or("none"),
             self.threads_enabled,
+            self.ig_stories_enabled,
+            self.ig_story_max_items
+                .map_or_else(|| "unlimited".to_string(), |n| n.to_string()),
             self.jina_api_key.is_some(),
             self.heartbeat.map_or_else(|| "off".to_string(), |d| format!("{}s", d.as_secs())),
             self.embed_user_agent,
         )
     }
+
+    /// A minimal, valid config for unit tests across modules (never reads env).
+    #[cfg(test)]
+    pub fn test_default() -> Self {
+        Self {
+            bot_token: "t".into(),
+            allowed_chats: vec![],
+            temp_dir: PathBuf::from("."),
+            cache_ttl: Duration::from_secs(1),
+            yt_dlp_path: "yt-dlp".into(),
+            gallery_dl_path: "gallery-dl".into(),
+            ig_cookies_path: None,
+            fallback_provider: None,
+            jina_api_key: None,
+            user_agent: "ua".into(),
+            embed_user_agent: "crawler-ua".into(),
+            threads_enabled: true,
+            ig_stories_enabled: true,
+            ig_story_max_items: Some(10),
+            threads_user_agent: "th-ua".into(),
+            threads_sec_ch_ua: "th-ch".into(),
+            max_upload_bytes: FIFTY_MIB,
+            queue_capacity: 16,
+            job_timeout: Duration::from_secs(300),
+            tg_send_timeout: Duration::from_secs(120),
+            request_pacing: Duration::from_millis(1500),
+            heartbeat: Some(Duration::from_secs(3600)),
+        }
+    }
+}
+
+/// Map `IG_STORY_MAX_ITEMS` to a cap; `0` means unlimited.
+fn story_cap_from(n: u64) -> Option<usize> {
+    (n > 0).then_some(n as usize)
 }
 
 fn req(var: &'static str) -> Result<String, AppError> {
@@ -226,27 +273,34 @@ mod tests {
     }
 
     fn bare() -> Config {
-        Config {
-            bot_token: "t".into(),
-            allowed_chats: vec![],
-            temp_dir: PathBuf::from("."),
-            cache_ttl: Duration::from_secs(1),
-            yt_dlp_path: "yt-dlp".into(),
-            gallery_dl_path: "gallery-dl".into(),
-            ig_cookies_path: None,
-            fallback_provider: None,
-            jina_api_key: None,
-            user_agent: "ua".into(),
-            embed_user_agent: "crawler-ua".into(),
-            threads_enabled: true,
-            threads_user_agent: "th-ua".into(),
-            threads_sec_ch_ua: "th-ch".into(),
-            max_upload_bytes: FIFTY_MIB,
-            queue_capacity: 16,
-            job_timeout: Duration::from_secs(300),
-            tg_send_timeout: Duration::from_secs(120),
-            request_pacing: Duration::from_millis(1500),
-            heartbeat: Some(Duration::from_secs(3600)),
-        }
+        Config::test_default()
+    }
+}
+
+#[cfg(test)]
+mod story_tests {
+    use super::*;
+
+    #[test]
+    fn story_cap_zero_means_unlimited() {
+        assert_eq!(story_cap_from(0), None);
+        assert_eq!(story_cap_from(10), Some(10));
+    }
+
+    #[test]
+    fn defaults_keep_stories_on_with_one_album_cap() {
+        let c = Config::test_default();
+        assert!(c.ig_stories_enabled);
+        assert_eq!(c.ig_story_max_items, Some(10));
+    }
+
+    #[test]
+    fn summary_reports_story_settings() {
+        let mut c = Config::test_default();
+        c.ig_stories_enabled = false;
+        c.ig_story_max_items = Some(7);
+        let s = c.summary();
+        assert!(s.contains("stories=false"), "{s}");
+        assert!(s.contains("story_max=7"), "{s}");
     }
 }

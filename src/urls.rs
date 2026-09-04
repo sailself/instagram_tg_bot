@@ -51,7 +51,9 @@ impl Platform {
 
 /// The upstream resource identified by a detected link. Direct post links are
 /// immediately canonical; Threads share aliases must be resolved by the worker
-/// before extraction because their token is not the post shortcode.
+/// before extraction because their token is not the post shortcode; Instagram
+/// stories (a single story item, or a highlight collection) are canonical but
+/// route to a different extractor chain — they are login-walled logged-out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkTarget {
     Post {
@@ -62,6 +64,13 @@ pub enum LinkTarget {
         share_url: String,
         token: String,
     },
+    /// An Instagram story item (`id` = the numeric story media id) or a
+    /// highlight collection (`id` = `highlight-<id>`). Distinct namespace from
+    /// post shortcodes: digits are valid shortcode characters too.
+    Story {
+        canonical_url: String,
+        id: String,
+    },
 }
 
 impl LinkTarget {
@@ -69,6 +78,7 @@ impl LinkTarget {
         match self {
             Self::Post { canonical_url, .. } => canonical_url,
             Self::ThreadsShare { share_url, .. } => share_url,
+            Self::Story { canonical_url, .. } => canonical_url,
         }
     }
 
@@ -76,6 +86,7 @@ impl LinkTarget {
         match self {
             Self::Post { shortcode, .. } => shortcode,
             Self::ThreadsShare { token, .. } => token,
+            Self::Story { id, .. } => id,
         }
     }
 
@@ -83,6 +94,7 @@ impl LinkTarget {
         match self {
             Self::Post { shortcode, .. } => platform.dedup_key(shortcode),
             Self::ThreadsShare { token, .. } => format!("th-share:{token}"),
+            Self::Story { id, .. } => format!("ig-story:{id}"),
         }
     }
 
@@ -95,6 +107,9 @@ impl LinkTarget {
             ) | (
                 Self::ThreadsShare { token: left, .. },
                 Self::ThreadsShare { token: right, .. }
+            ) | (
+                Self::Story { id: left, .. },
+                Self::Story { id: right, .. }
             ) if left == right
         )
     }
@@ -140,6 +155,15 @@ static THREADS_SHARE_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid Threads share url regex")
 });
 
+/// Matches Instagram story links `/stories/<username>/<numeric id>` — a single
+/// story item — and `/stories/highlights/<numeric id>` (the username slot holds
+/// the literal `highlights`). Captures the username (1) and the id (2). The
+/// bare story tray (`/stories/<username>/`, no id) is deliberately not matched.
+static IG_STORY_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)https?://(?:www\.|m\.)?instagram\.com/stories/([A-Za-z0-9_.]+)/(\d+)")
+        .expect("valid IG story url regex")
+});
+
 /// Find all Instagram + Threads post links in a blob of text, de-duplicated by
 /// (platform, shortcode) — first occurrence wins. The handler feeds this the
 /// message text plus any entity URLs (PLAN §5).
@@ -171,6 +195,32 @@ pub fn find_links(text: &str) -> Vec<DetectedLink> {
             },
         });
     }
+    for caps in IG_STORY_URL_RE.captures_iter(text) {
+        let Some(full_match) = caps.get(0) else {
+            continue;
+        };
+        // `123abc` is not a story id — require a path/query/end boundary.
+        if !has_token_boundary(text, full_match.end()) {
+            continue;
+        }
+        let user = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+        let id = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
+        let target = if user.eq_ignore_ascii_case("highlights") {
+            LinkTarget::Story {
+                canonical_url: highlight_url(id),
+                id: format!("highlight-{id}"),
+            }
+        } else {
+            LinkTarget::Story {
+                canonical_url: story_url(user, id),
+                id: id.to_string(),
+            }
+        };
+        push(DetectedLink {
+            platform: Platform::Instagram,
+            target,
+        });
+    }
     for caps in THREADS_POST_URL_RE.captures_iter(text) {
         let user = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
         let shortcode = caps
@@ -189,7 +239,7 @@ pub fn find_links(text: &str) -> Vec<DetectedLink> {
         let Some(full_match) = caps.get(0) else {
             continue;
         };
-        if !has_share_url_boundary(text, full_match.end()) {
+        if !has_token_boundary(text, full_match.end()) {
             continue;
         }
         let domain = caps.get(1).map(|m| m.as_str()).unwrap_or("com");
@@ -208,7 +258,10 @@ pub fn find_links(text: &str) -> Vec<DetectedLink> {
     out
 }
 
-fn has_share_url_boundary(text: &str, match_end: usize) -> bool {
+/// True when the text right after a captured token ends the URL path segment
+/// (end of text, whitespace, `/`, `?`, `#`) — so a token class that stops at a
+/// character boundary can't silently accept a longer, malformed token.
+fn has_token_boundary(text: &str, match_end: usize) -> bool {
     text.get(match_end..)
         .and_then(|tail| tail.chars().next())
         .is_none_or(|next| next.is_whitespace() || matches!(next, '/' | '?' | '#'))
@@ -218,6 +271,18 @@ fn has_share_url_boundary(text: &str, match_end: usize) -> bool {
 /// UA), yt-dlp, fallbacks, and shown in captions.
 pub fn post_url(shortcode: &str) -> String {
     format!("https://www.instagram.com/p/{shortcode}/")
+}
+
+/// Canonical Instagram story-item URL. The username is required: the
+/// login-backed extractors resolve it to the account's story reel and then pick
+/// the item by id. Tracking params (`utm_source`, `igsh`) are dropped.
+pub fn story_url(username: &str, id: &str) -> String {
+    format!("https://www.instagram.com/stories/{username}/{id}/")
+}
+
+/// Canonical Instagram highlight URL.
+pub fn highlight_url(id: &str) -> String {
+    format!("https://www.instagram.com/stories/highlights/{id}/")
 }
 
 /// Canonical Threads post URL. The primary domain is `threads.com` (since
@@ -450,6 +515,76 @@ mod tests {
         assert_ne!(
             Platform::Instagram.dedup_key("SAME"),
             Platform::Threads.dedup_key("SAME")
+        );
+    }
+}
+
+#[cfg(test)]
+mod story_tests {
+    use super::*;
+
+    #[test]
+    fn story_item_link_is_detected_as_story_target() {
+        let links = find_links(
+            "https://www.instagram.com/stories/nasa/3570766765028588805/?utm_source=ig_story_item_share&igsh=abc",
+        );
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].platform, Platform::Instagram);
+        assert_eq!(
+            links[0].target,
+            LinkTarget::Story {
+                canonical_url: "https://www.instagram.com/stories/nasa/3570766765028588805/".into(),
+                id: "3570766765028588805".into(),
+            }
+        );
+        assert_eq!(links[0].dedup_key(), "ig-story:3570766765028588805");
+    }
+
+    #[test]
+    fn highlight_link_is_detected_with_its_own_identity() {
+        let links = find_links("https://instagram.com/stories/highlights/17895485073021464/");
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].target.url(),
+            "https://www.instagram.com/stories/highlights/17895485073021464/"
+        );
+        assert_eq!(links[0].target.id(), "highlight-17895485073021464");
+        assert_eq!(links[0].dedup_key(), "ig-story:highlight-17895485073021464");
+    }
+
+    #[test]
+    fn story_links_dedup_by_id_and_stay_distinct_from_posts() {
+        let t = "https://www.instagram.com/stories/a.b_c/111/ https://instagram.com/stories/a.b_c/111/?x=1 \
+                 https://www.instagram.com/p/111/";
+        let links = find_links(t);
+        assert_eq!(
+            links.len(),
+            2,
+            "story deduped by id; post with same digits kept"
+        );
+        assert!(matches!(links[0].target, LinkTarget::Post { .. }));
+        assert!(matches!(links[1].target, LinkTarget::Story { .. }));
+    }
+
+    #[test]
+    fn story_tray_and_malformed_story_paths_are_ignored() {
+        // The bare tray (no item id) and non-numeric ids are not story links.
+        assert!(find_links("https://www.instagram.com/stories/nasa/").is_empty());
+        assert!(find_links("https://www.instagram.com/stories/nasa").is_empty());
+        assert!(find_links("https://www.instagram.com/stories/highlights/").is_empty());
+        assert!(find_links("https://www.instagram.com/stories/nasa/abc/").is_empty());
+        assert!(find_links("https://example.com/stories/nasa/123/").is_empty());
+    }
+
+    #[test]
+    fn story_canonical_urls() {
+        assert_eq!(
+            story_url("nasa", "123"),
+            "https://www.instagram.com/stories/nasa/123/"
+        );
+        assert_eq!(
+            highlight_url("456"),
+            "https://www.instagram.com/stories/highlights/456/"
         );
     }
 }

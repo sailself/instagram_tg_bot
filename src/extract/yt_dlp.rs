@@ -11,11 +11,42 @@ use tokio::process::Command;
 pub struct YtDlpExtractor {
     path: String,
     cookies: Option<String>,
+    /// Pass `--no-playlist`. For a story-*item* URL yt-dlp otherwise expands
+    /// to the account's whole current story tray. Off for posts: carousels are
+    /// playlists that must stay expanded.
+    no_playlist: bool,
 }
 
 impl YtDlpExtractor {
     pub fn new(path: String, cookies: Option<String>) -> Self {
-        Self { path, cookies }
+        Self {
+            path,
+            cookies,
+            no_playlist: false,
+        }
+    }
+
+    /// Restrict a playlist-capable URL to the single item it names.
+    pub fn no_playlist(mut self) -> Self {
+        self.no_playlist = true;
+        self
+    }
+
+    /// The full argument vector (url last), so the invocation is unit-testable.
+    fn args(&self, url: &str) -> Vec<String> {
+        let mut args: Vec<String> = ["-J", "--no-warnings", "--no-progress", "--ignore-config"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        if self.no_playlist {
+            args.push("--no-playlist".into());
+        }
+        if let Some(c) = &self.cookies {
+            args.push("--cookies".into());
+            args.push(c.clone());
+        }
+        args.push(url.to_string());
+        args
     }
 }
 
@@ -27,14 +58,7 @@ impl Extractor for YtDlpExtractor {
 
     async fn extract(&self, url: &str, _shortcode: &str) -> Result<Post, ExtractError> {
         let mut cmd = Command::new(&self.path);
-        cmd.arg("-J")
-            .arg("--no-warnings")
-            .arg("--no-progress")
-            .arg("--ignore-config");
-        if let Some(c) = &self.cookies {
-            cmd.arg("--cookies").arg(c);
-        }
-        cmd.arg(url);
+        cmd.args(self.args(url));
 
         let output = match cmd.output().await {
             Ok(o) => o,
@@ -232,5 +256,29 @@ mod tests {
             classify_stderr("instagram sent an empty media response. use --cookies-from-browser or --cookies"),
             ExtractError::Blocked
         ));
+    }
+}
+
+#[cfg(test)]
+mod story_tests {
+    use super::*;
+
+    #[test]
+    fn no_playlist_flag_is_opt_in() {
+        // Post chain: playlists (carousels) must stay expanded.
+        let plain = YtDlpExtractor::new("yt-dlp".into(), None);
+        assert!(!plain.args("u").iter().any(|a| a == "--no-playlist"));
+        // Story chain: a story-item URL would otherwise expand to the whole tray.
+        let story = YtDlpExtractor::new("yt-dlp".into(), Some("c.txt".into())).no_playlist();
+        let args = story.args("u");
+        assert!(args.iter().any(|a| a == "--no-playlist"));
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--cookies" && w[1] == "c.txt"));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("u"),
+            "url is the final argument"
+        );
     }
 }

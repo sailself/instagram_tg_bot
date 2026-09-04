@@ -303,6 +303,34 @@ pub fn build_ig_chain(cfg: &Config, http: reqwest::Client) -> ExtractorChain {
     chain
 }
 
+/// Instagram **story** chain: gallery-dl → yt-dlp (`--no-playlist`), media
+/// required. Stories are login-walled for anonymous clients, so this chain
+/// exists **only when `IG_COOKIES_PATH` is set** — `None` otherwise, and the
+/// worker answers story links with a "needs a login session" notice instead of
+/// spawning a doomed extraction. Order: gallery-dl handles image *and* video
+/// stories; yt-dlp's story extractor yields only video items.
+///
+/// Deliberately excluded: the embed scraper (a logged-out story page carries a
+/// single `og:image` — the **profile picture** — which the OG fallback would
+/// ship as if it were the story) and the external fallback (unverified for
+/// story URLs).
+pub fn build_ig_story_chain(cfg: &Config) -> Option<ExtractorChain> {
+    let cookies = cfg.ig_cookies_path.as_ref()?;
+    let backends: Vec<Box<dyn Extractor>> = vec![
+        Box::new(gallery_dl::GalleryDlExtractor::new(
+            cfg.gallery_dl_path.clone(),
+            cookies.clone(),
+        )),
+        Box::new(
+            yt_dlp::YtDlpExtractor::new(cfg.yt_dlp_path.clone(), Some(cookies.clone()))
+                .no_playlist(),
+        ),
+    ];
+    let chain = ExtractorChain::new(backends);
+    tracing::info!(backends = ?chain.names(), "instagram story extractor chain built");
+    Some(chain)
+}
+
 /// Threads chain: in-process inline-JSON scrape → `/embed` HTML fallback. No
 /// yt-dlp/gallery-dl (neither supports Threads upstream). Accepts text-only
 /// posts (Threads is text-first).
@@ -431,5 +459,22 @@ mod tests {
         assert!(matches!(c.extract("u", "s").await, Err(ExtractError::NotFound)));
         let c = ExtractorChain::new_accepting_textonly(vec![Box::new(TextOnly(None))]);
         assert!(matches!(c.extract("u", "s").await, Err(ExtractError::NotFound)));
+    }
+}
+
+#[cfg(test)]
+mod story_chain_tests {
+    use super::*;
+
+    #[test]
+    fn story_chain_requires_cookies_and_never_uses_the_embed_scraper() {
+        let mut cfg = Config::test_default();
+        assert!(build_ig_story_chain(&cfg).is_none(), "cookieless -> no story chain");
+        cfg.ig_cookies_path = Some("/etc/igbot/cookies.txt".into());
+        let chain = build_ig_story_chain(&cfg).expect("cookies -> story chain");
+        // gallery-dl first (it handles image stories; yt-dlp only yields video
+        // items), then yt-dlp. The embed scraper is excluded: a logged-out
+        // story page's og:image is the profile picture, not the story.
+        assert_eq!(chain.names(), vec!["gallery-dl", "yt-dlp"]);
     }
 }

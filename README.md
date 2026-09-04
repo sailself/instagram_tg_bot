@@ -53,7 +53,8 @@ is the profile picture). So this chain is **gallery-dl → yt-dlp**, both with
 cookies, and exists **only when `IG_COOKIES_PATH` is set**. Without cookies a
 story link gets a short "needs a login session" reply (or is ignored entirely
 with `IG_STORIES_ENABLED=0`). Highlights are capped at `IG_STORY_MAX_ITEMS`
-(default 10, one album) with a "showing N of M" note.
+(default 10, one album) with a "showing N of M" note. How to obtain and install
+the cookies file: [**Cookies**](#cookies-optional--instagram-stories--gallery-dl) below.
 
 **Threads chain** (neither yt-dlp nor gallery-dl supports Threads, so it's
 in-process only):
@@ -210,13 +211,144 @@ See [`.env.example`](.env.example) for everything. Key variables:
 | `THREADS_USER_AGENT` / `THREADS_SEC_CH_UA` | desktop-browser UA + matching client-hint for the Threads scrape (hot-config) |
 | `RUST_LOG` | log filter (`igbot=info,warn` default; `igbot=debug` for detail) |
 | `HEARTBEAT_SECS` / `LOG_DIR` / `LOG_MAX_FILES` | metrics heartbeat / optional rotating file logs |
-| `IG_COOKIES_PATH` | enables the gallery-dl + cookie path **and Instagram Stories** (use a **burner** only) |
+| `IG_COOKIES_PATH` | Netscape `cookies.txt` from a **burner** account; enables the gallery-dl + cookie path **and Instagram Stories**. Must be read-**write** for the service, i.e. under `/opt/igbot/` — see [Cookies](#cookies-optional--instagram-stories--gallery-dl) |
 | `IG_STORIES_ENABLED` | set `0/false/no/off` to ignore story links instead of replying "needs a login session" (default on) |
 | `IG_STORY_MAX_ITEMS` | max items mirrored per story/highlight link (default 10; `0` = unlimited) |
 | `FALLBACK_PROVIDER` / `JINA_API_KEY` | enables the external fallback (off by default) |
 
 Brittle bits (User-Agent, endpoints, timeouts) are hot-config via env so a break
 is a config change, not a recompile.
+
+## Cookies (optional — Instagram Stories + gallery-dl)
+
+The default chains are **cookieless**. You need this section only for
+**Instagram Stories / highlights** (login-walled) or to turn on the gallery-dl
+backstop for posts. **Threads never uses cookies**: its chain is an anonymous
+in-process scrape, and no code path reads Threads cookies today.
+
+Rules first — getting these wrong burns an account or the bot's IP:
+
+- **Burner account only.** Never your real Instagram login. A session driven
+  from a datacenter IP can be challenged or banned at any time; the account is
+  disposable by design.
+- **Dedicated browser profile, kept logged in.** Logging out in the browser
+  invalidates the `sessionid` server-side, and the bot's copy dies with it.
+- **Never commit or paste the file.** `cookies.txt` is in `.gitignore`; the bot
+  logs only *whether* a cookies path is set, never its contents.
+
+### 1. Export a `cookies.txt` (Netscape format)
+
+yt-dlp and gallery-dl both read the classic **Netscape / Mozilla `cookies.txt`**:
+one cookie per line, seven **tab**-separated fields. Any of these produces it.
+
+**Browser extension (simplest).** In the burner profile, log into
+[instagram.com](https://www.instagram.com) and stay on the site, then:
+
+- Chrome / Edge / Brave — [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc):
+  click the extension → **Export** (current site) → save as `cookies.txt`.
+- Firefox — [cookies.txt](https://addons.mozilla.org/firefox/addon/cookies-txt/):
+  **Current Site** → save.
+
+Both write Netscape format and include `HttpOnly` cookies (`sessionid` is one).
+Some exporters prefix those lines with `#HttpOnly_` — that is normal, **don't
+delete them**; both tools understand the prefix.
+
+**yt-dlp from a Firefox profile (no extension).** On the machine that has the
+burner profile:
+
+```bash
+yt-dlp --cookies-from-browser firefox --cookies cookies.txt \
+       --skip-download --no-warnings "https://www.instagram.com/p/<any public post>/"
+```
+
+yt-dlp loads the browser's jar and dumps it to `cookies.txt` on exit (even if
+that extraction fails). This exports **every** cookie in the profile, which is
+another reason it must be a dedicated burner profile. `--cookies-from-browser
+chrome` often cannot decrypt recent Chrome builds (App-Bound Encryption,
+especially on Windows) — use Firefox or the extension.
+
+**By hand (last resort).** DevTools → Application / Storage → Cookies →
+`https://www.instagram.com`, and write the lines yourself:
+
+```
+# Netscape HTTP Cookie File
+.instagram.com	TRUE	/	TRUE	1800000000	sessionid	<value>
+.instagram.com	TRUE	/	TRUE	1800000000	csrftoken	<value>
+.instagram.com	TRUE	/	TRUE	1800000000	ds_user_id	<value>
+.instagram.com	TRUE	/	TRUE	1800000000	mid	<value>
+.instagram.com	TRUE	/	TRUE	1800000000	ig_did	<value>
+```
+
+Fields: `domain`, `include-subdomains` (`TRUE` when the domain starts with a
+dot), `path`, `secure`, `expiry` (Unix seconds; `0` = session cookie), `name`,
+`value` — separated by real **tabs**, not spaces.
+
+**What must be in it.** `sessionid` *is* the login: gallery-dl's Instagram
+extractor requires it and yt-dlp uses its presence to decide it is logged in.
+`csrftoken` (yt-dlp sends it as `X-CSRFToken`) and `ds_user_id` should be there
+too; `mid` / `ig_did` / `datr` make the session look like the same device and
+reduce "suspicious login" checkpoints. Exporting the whole site (the default)
+captures all of them.
+
+**Threads too?** It is the same Meta login, so if you want Threads cookies in
+the same file, repeat the export while on
+[threads.com](https://www.threads.com) — a `cookies.txt` is multi-domain, and
+extra `.threads.com` / `.threads.net` lines are harmless. Just know that
+**nothing in the bot reads them today**; the Threads chain is cookieless by
+design and the file is only ever handed to the Instagram extractors.
+
+### 2. Install it on the server
+
+Put the file where the **service can read *and write* it**. yt-dlp rewrites the
+cookie jar on every exit and exits with a traceback when it can't — the bot
+sees that as a failed run — and gallery-dl rewrites it through a temp file in
+the same directory. `deploy/igbot.service` runs under `ProtectSystem=strict`,
+so the only writable location is `ReadWritePaths=/opt/igbot`. **Not
+`/etc/igbot`.**
+
+```bash
+# from your machine
+scp cookies.txt ubuntu@<vm>:/tmp/cookies.txt
+
+# on the VM
+sudo install -o botuser -g botuser -m 0600 /tmp/cookies.txt /opt/igbot/cookies.txt
+shred -u /tmp/cookies.txt 2>/dev/null || rm -f /tmp/cookies.txt
+
+# point the bot at it (first time only — the path is read at startup)
+echo 'IG_COOKIES_PATH=/opt/igbot/cookies.txt' | sudo tee -a /etc/igbot/igbot.env
+sudo systemctl restart igbot
+journalctl -u igbot -n 20 | grep -o 'cookies=[a-z]*'      # expect cookies=true
+```
+
+Replacing the file's *contents* later needs **no restart**: the path is handed
+to yt-dlp / gallery-dl on every run and they read it fresh. Keep ownership
+`botuser:botuser` — a manual `yt-dlp --cookies …` test run as root rewrites the
+file as root and the service loses write access. gallery-dl's temp-file rewrite
+recreates the file with the process umask, so its mode may loosen from `0600`
+to `0644` after the first story fetch; tighten it again if other users share
+the VM.
+
+### 3. Verify (as the service user)
+
+```bash
+sudo -u botuser gallery-dl -j --cookies /opt/igbot/cookies.txt \
+     "https://www.instagram.com/stories/<a user with a live story>/" | head -c 400
+```
+
+JSON means the session works (an empty result just means no live story);
+`401` / `403` / `login` / `challenge` in the output means the cookies are dead
+or the account is being challenged. Then post a `/stories/<user>/<id>/` link in
+an allowed chat.
+
+### 4. When it stops working
+
+The bot tells you. A story link answered with **"Instagram rejected the bot's
+login session (it may have expired)"** means the cookies are dead: re-export
+from the still-logged-in burner profile and overwrite `/opt/igbot/cookies.txt`.
+**"Couldn't find that story — it may have expired"** is *not* a cookie problem;
+stories vanish after 24 h. Instagram sessions normally live for months, but a
+password change, a browser logout, or a security checkpoint on the burner
+kills them immediately.
 
 ## Limitations & notes
 

@@ -149,7 +149,12 @@ Long polling → **no inbound ports / TLS / domain**. Target: OCI `E2.1.Micro`
 (x86-64, 1 GB), Ubuntu. `deploy/setup.sh` installs ffmpeg + yt-dlp + 2 GB swap +
 systemd units (service with `MemoryMax`, daily yt-dlp auto-update, 5-min
 keepalive against idle reclaim). The bot token and chat allowlist live in
-`/etc/igbot/igbot.env` (chmod 600) — never commit them.
+`/etc/igbot/igbot.env` (chmod 600) — never commit them. The optional cookies
+file must be **readable and writable by `botuser`**, so it lives under
+`/opt/igbot/` (the unit's `ReadWritePaths`), never `/etc/igbot/`: yt-dlp
+rewrites the jar on exit and exits non-zero when it can't, which the extractor
+reads as a failed run. Threads never consumes cookies — the file only feeds the
+Instagram chains.
 
 ## Verification before "done"
 

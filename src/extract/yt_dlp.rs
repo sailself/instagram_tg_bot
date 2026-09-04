@@ -82,10 +82,27 @@ impl Extractor for YtDlpExtractor {
         }
 
         tracing::debug!(stdout_bytes = output.stdout.len(), "yt-dlp ok");
-        let value: Value = serde_json::from_slice(&output.stdout)
-            .map_err(|e| ExtractError::Transient(format!("yt-dlp json: {e}")))?;
-        parse_info(&value, url).ok_or(ExtractError::NotFound)
+        interpret_stdout(&output.stdout, url)
     }
+}
+
+/// Turn a successful (exit 0) `yt-dlp -J` run's stdout into a `Post`.
+///
+/// Exit 0 with no media is *not* "not found". yt-dlp prints the JSON literal
+/// `null` — and, under `--no-warnings`, nothing on stderr — when its extractor
+/// returns nothing; the everyday case is `--no-playlist` on an **image** story
+/// item, because the Instagram story extractor is video-only. The item exists,
+/// this backend just cannot produce it, so report *the backend* as unavailable
+/// and let gallery-dl (or the failure copy) take it from there.
+fn interpret_stdout(stdout: &[u8], url: &str) -> Result<Post, ExtractError> {
+    let value: Value = serde_json::from_slice(stdout)
+        .map_err(|e| ExtractError::Transient(format!("yt-dlp json: {e}")))?;
+    parse_info(&value, url).ok_or_else(|| {
+        ExtractError::Unavailable(
+            "yt-dlp returned no media (its story extractor is video-only; image items need gallery-dl)"
+                .into(),
+        )
+    })
 }
 
 fn classify_stderr(stderr: &str) -> ExtractError {
@@ -262,6 +279,32 @@ mod tests {
 #[cfg(test)]
 mod story_tests {
     use super::*;
+
+    #[test]
+    fn empty_result_is_backend_unavailable_not_not_found() {
+        // yt-dlp prints the JSON literal `null` and exits 0 when its extractor
+        // returns nothing — e.g. `--no-playlist` on an *image* story item, since
+        // the story extractor is video-only. The item exists; yt-dlp just can't
+        // produce it. That must not read as "not found / expired".
+        for stdout in [&b"null\n"[..], br#"{"_type":"playlist","entries":[]}"#] {
+            match interpret_stdout(stdout, "u") {
+                Err(ExtractError::Unavailable(msg)) => {
+                    assert!(msg.contains("gallery-dl"), "operator hint missing: {msg}")
+                }
+                other => panic!("expected Unavailable, got {other:?}"),
+            }
+        }
+        // Garbage is still a transient parse error; a real reel still parses.
+        assert!(matches!(
+            interpret_stdout(b"not json", "u"),
+            Err(ExtractError::Transient(_))
+        ));
+        assert!(interpret_stdout(
+            br#"{"uploader":"bob","url":"https://scontent.cdninstagram.com/v/r.mp4","formats":[]}"#,
+            "u"
+        )
+        .is_ok());
+    }
 
     #[test]
     fn no_playlist_flag_is_opt_in() {

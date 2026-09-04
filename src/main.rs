@@ -48,6 +48,9 @@ async fn main() -> Result<()> {
     let tgbot =
         teloxide::Bot::with_client(cfg.bot_token.clone(), tg_http).throttle(Limits::default());
     preflight(&tgbot).await?;
+    // Subprocess backends: warn now if a configured binary can't run, instead
+    // of discovering it one failed job at a time.
+    extract::report_backend_binaries(&cfg);
 
     let dedup = dedup::Dedup::new(cfg.cache_ttl);
     let metrics = Arc::new(metrics::Metrics::new());

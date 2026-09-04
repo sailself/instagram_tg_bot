@@ -113,6 +113,16 @@ only (`threads_json` primary, `threads_embed` the `/embed`-HTML fallback).
   doomed subprocess). yt-dlp's story extractor yields **video items only** and
   expands a story-item URL to the whole tray unless `--no-playlist` is passed;
   gallery-dl goes first because it also handles image stories.
+- **yt-dlp `-J` prints the literal `null` and exits 0 when its extractor returns
+  nothing** — and `--no-warnings` hides the only hint on stderr. With
+  `--no-playlist` on an *image* story item that is the normal outcome (the story
+  extractor is video-only), not an error. `yt_dlp.rs::interpret_stdout` maps an
+  exit-0/no-media result to `Unavailable`, never `NotFound`: the item exists and
+  gallery-dl is the backend for it. `failure_copy` turns the all-`Unavailable`
+  story case into a "needs gallery-dl" reply; `report_backend_binaries` warns at
+  startup when cookies are set but gallery-dl can't run. Don't re-classify this
+  as not-found — that is exactly the misleading "expired or private" reply this
+  guards against.
 - **Never re-parse the bot's own messages.** Replies end with a `🔗 <link>`
   footer; a member forwarding one into a chat would otherwise make the bot
   mirror its own mirror. `handler.rs::is_from_self` drops messages whose
@@ -146,8 +156,9 @@ only (`threads_json` primary, `threads_embed` the `/embed`-HTML fallback).
 ## Deployment
 
 Long polling → **no inbound ports / TLS / domain**. Target: OCI `E2.1.Micro`
-(x86-64, 1 GB), Ubuntu. `deploy/setup.sh` installs ffmpeg + yt-dlp + 2 GB swap +
-systemd units (service with `MemoryMax`, daily yt-dlp auto-update, 5-min
+(x86-64, 1 GB), Ubuntu. `deploy/setup.sh` installs ffmpeg + yt-dlp + gallery-dl
+(own venv under `/opt/gallery-dl`, symlinked into `/usr/local/bin`) + 2 GB swap +
+systemd units (service with `MemoryMax`, daily yt-dlp/gallery-dl auto-update, 5-min
 keepalive against idle reclaim). The bot token and chat allowlist live in
 `/etc/igbot/igbot.env` (chmod 600) — never commit them. The optional cookies
 file must be **readable and writable by `botuser`**, so it lives under

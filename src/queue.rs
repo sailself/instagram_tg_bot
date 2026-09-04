@@ -311,6 +311,11 @@ fn failure_copy(job: &Job, error: &ExtractError) -> String {
         (ContentKind::Story, ExtractError::Blocked) => {
             "🔒 Couldn't fetch that story — Instagram rejected the bot's login session (it may have expired).".to_string()
         }
+        // Both backends bowed out: yt-dlp's story extractor is video-only, so
+        // this is an image story with gallery-dl missing (or not runnable).
+        (ContentKind::Story, ExtractError::Unavailable(_)) => {
+            "🖼️ Couldn't fetch that story — it's probably an image story, and this bot's image-capable backend (gallery-dl) isn't available. Video stories still work.".to_string()
+        }
         (ContentKind::Post, ExtractError::NotFound) => {
             "🤷 Couldn't find that post — it may be private, removed, or image-only behind a login.".to_string()
         }
@@ -615,5 +620,23 @@ mod story_tests {
         let th = job(Platform::Threads, ContentKind::Post);
         assert!(failure_copy(&th, &ExtractError::Transient("x".into()))
             .contains("Threads may be rate-limiting"));
+    }
+
+    #[test]
+    fn image_story_without_gallery_dl_gets_actionable_copy() {
+        // yt-dlp's story extractor is video-only; when gallery-dl is missing the
+        // chain ends with `Unavailable`, and the user must not be told the story
+        // "expired" or that Instagram is rate-limiting.
+        let story = job(Platform::Instagram, ContentKind::Story);
+        let copy = failure_copy(
+            &story,
+            &ExtractError::Unavailable("gallery-dl binary not found at 'gallery-dl'".into()),
+        );
+        assert!(copy.contains("image story"), "{copy}");
+        assert!(copy.contains("gallery-dl"), "{copy}");
+        assert!(
+            !copy.contains("expired") && !copy.contains("rate-limiting"),
+            "{copy}"
+        );
     }
 }

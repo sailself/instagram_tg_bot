@@ -1,8 +1,10 @@
 [Unit]
-Description=Update yt-dlp (Instagram extractor breaks often; PLAN §7.4)
+Description=Update yt-dlp + gallery-dl (Instagram extractors break often; PLAN §7.4)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/yt-dlp -U
+# `-` prefix: a pip hiccup must not mark the unit failed or skip nothing after it.
+ExecStart=-/opt/gallery-dl/bin/pip install --quiet --upgrade gallery-dl

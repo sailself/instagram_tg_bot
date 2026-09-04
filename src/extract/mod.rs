@@ -248,6 +248,48 @@ pub(crate) fn map_status(code: u16) -> ExtractError {
     }
 }
 
+/// Run `<path> --version` to check a subprocess backend is actually installed.
+/// Startup-only operator aid: `Ok(first line of output)` or `Err(reason)`.
+pub fn probe_binary(path: &str) -> Result<String, String> {
+    match std::process::Command::new(path).arg("--version").output() {
+        Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string()),
+        Ok(out) => Err(format!("`{path} --version` exited with {}", out.status)),
+        Err(e) => Err(format!("cannot run `{path}`: {e}")),
+    }
+}
+
+/// Startup check for the subprocess backends the configured chains will call.
+/// A missing binary otherwise surfaces only per job, as a WARN buried in the
+/// chain — say it once, loudly, before the first link arrives. yt-dlp is always
+/// in the Instagram post chain; gallery-dl matters once cookies are set, since
+/// it is then the *only* backend able to fetch image stories (yt-dlp's story
+/// extractor is video-only).
+pub fn report_backend_binaries(cfg: &Config) {
+    match probe_binary(&cfg.yt_dlp_path) {
+        Ok(v) => tracing::info!(binary = %cfg.yt_dlp_path, version = %v, "yt-dlp found"),
+        Err(e) => tracing::warn!(
+            binary = %cfg.yt_dlp_path,
+            error = %e,
+            "yt-dlp not runnable — Instagram video fallback and video stories will fail; install it or set YT_DLP_PATH"
+        ),
+    }
+    if cfg.ig_cookies_path.is_some() {
+        match probe_binary(&cfg.gallery_dl_path) {
+            Ok(v) => tracing::info!(binary = %cfg.gallery_dl_path, version = %v, "gallery-dl found"),
+            Err(e) => tracing::warn!(
+                binary = %cfg.gallery_dl_path,
+                error = %e,
+                "IG_COOKIES_PATH is set but gallery-dl is not runnable — image stories (and login-walled image posts) will fail until it is installed; set GALLERY_DL_PATH if it lives elsewhere"
+            ),
+        }
+    }
+}
+
 /// How actionable an error is, so the chain surfaces the most useful cause
 /// instead of letting a later empty-media `NotFound` mask an earlier `Blocked`.
 fn severity(e: &ExtractError) -> u8 {
@@ -465,6 +507,15 @@ mod tests {
 #[cfg(test)]
 mod story_chain_tests {
     use super::*;
+
+    #[test]
+    fn probe_binary_reports_missing_and_present_tools() {
+        assert!(probe_binary("igbot-definitely-not-a-real-binary").is_err());
+        // `CARGO` is set by cargo for every crate it compiles, so it names a
+        // binary guaranteed to exist wherever these tests run.
+        let v = probe_binary(env!("CARGO")).expect("cargo --version");
+        assert!(v.to_lowercase().contains("cargo"), "{v}");
+    }
 
     #[test]
     fn story_chain_requires_cookies_and_never_uses_the_embed_scraper() {

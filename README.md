@@ -50,7 +50,10 @@ forwards from other users and bots are processed normally.)
 `/stories/highlights/<id>/`): Instagram serves stories **only to logged-in
 sessions** — anonymously, the story page is a login wall (its lone `og:image`
 is the profile picture). So this chain is **gallery-dl → yt-dlp**, both with
-cookies, and exists **only when `IG_COOKIES_PATH` is set**. Without cookies a
+cookies, and exists **only when `IG_COOKIES_PATH` is set**. gallery-dl goes first
+because yt-dlp's story extractor is **video-only**: with gallery-dl missing, an
+image story fails with a reply that says so (never a misleading "expired").
+Without cookies a
 story link gets a short "needs a login session" reply (or is ignored entirely
 with `IG_STORIES_ENABLED=0`). Highlights are capped at `IG_STORY_MAX_ITEMS`
 (default 10, one album) with a "showing N of M" note. How to obtain and install
@@ -74,8 +77,10 @@ chains.
 ## Prerequisites
 
 - A bot token from **@BotFather**.
-- **Runtime:** `ffmpeg` + `yt-dlp` (the standalone binary) — installed for you by
-  `deploy/setup.sh` on the server.
+- **Runtime:** `ffmpeg` + `yt-dlp` (the standalone binary) + `gallery-dl` — all
+  installed for you by `deploy/setup.sh` on the server. gallery-dl only matters
+  once cookies are set, but it is then the **one backend that fetches image
+  stories** (yt-dlp's story extractor is video-only). Locally: `pip install gallery-dl`.
 - **To build from source:** Rust ≥ 1.85. (For deployment you can skip the build
   entirely and use the prebuilt release binary — see *Deploy* below.)
 
@@ -137,8 +142,8 @@ sudo systemctl start igbot
 journalctl -u igbot -f
 ```
 
-`deploy/setup.sh` also creates a **2 GB swap**, a daily **yt-dlp auto-update**
-timer, and a 5-minute **keepalive** (so the always-free VM isn't reclaimed for
+`deploy/setup.sh` also creates a **2 GB swap**, a daily **yt-dlp + gallery-dl
+auto-update** timer, and a 5-minute **keepalive** (so the always-free VM isn't reclaimed for
 idleness). The bot uses **long polling**, so **no inbound ports / TLS / domain**
 are required. Memory is guarded by `MemoryMax=800M` + single-worker concurrency.
 
@@ -299,6 +304,11 @@ design and the file is only ever handed to the Instagram extractors.
 
 ### 2. Install it on the server
 
+First make sure **gallery-dl is installed** next to yt-dlp (`deploy/setup.sh`
+does this; locally, `pip install gallery-dl`). yt-dlp's story extractor is
+video-only, so gallery-dl is the backend that fetches **image** stories. The bot
+warns at startup if cookies are set but gallery-dl can't be run.
+
 Put the file where the **service can read *and write* it**. yt-dlp rewrites the
 cookie jar on every exit and exits with a traceback when it can't — the bot
 sees that as a failed run — and gallery-dl rewrites it through a temp file in
@@ -361,10 +371,11 @@ kills them immediately.
   graceful reply rather than silence. The Threads scrape, repost/quote nesting,
   and poll rendering still want **live validation** against real posts.
 - Instagram **Stories** are login-walled: without `IG_COOKIES_PATH` the bot can
-  only say so. With cookies, the story chain (gallery-dl → yt-dlp) still wants
-  **live validation** — this repo's tests cover routing, parsing, and copy, not a
-  real logged-in fetch. Stories expire after 24 h; an expired item reads as
-  "not found".
+  only say so. With cookies, the story chain (gallery-dl → yt-dlp) was validated
+  live on 2026-09-04: a video story via yt-dlp, an image story via gallery-dl.
+  **Image stories need gallery-dl installed** — yt-dlp's story extractor is
+  video-only and reports nothing for them. Stories expire after 24 h; an
+  expired item reads as "not found".
 - The self-forward guard keys on Telegram's forward origin. A forward whose
   origin is hidden (user privacy setting, or a channel the bot posted into) is
   not attributable to the bot and is processed like any other message.

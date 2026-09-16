@@ -9,7 +9,7 @@
 
 use super::{dedup_media, is_meta_cdn, normalize_cdn_url, ExtractError, Extractor, Media, Post};
 use async_trait::async_trait;
-use scraper::{Html, Selector};
+use scraper::{ElementRef, Html, Selector};
 
 pub struct ThreadsEmbedScraper {
     http: reqwest::Client,
@@ -71,16 +71,28 @@ impl Extractor for ThreadsEmbedScraper {
     }
 }
 
-/// Parse the SSR embed card: media from `img.img` / `<video>` (CDN-gated),
+/// Parse the SSR embed card: media from non-avatar `img.img` / `<video>` (CDN-gated),
 /// caption from `.BodyTextContainer`, author from `.NameContainer`. Returns a
 /// text-only [`Post`] when there's a caption but no media.
 fn parse_embed(html: &str, original_url: &str) -> Option<Post> {
     let doc = Html::parse_document(html);
 
     let mut media = Vec::new();
-    for src in all_attrs(&doc, "img.img", "src") {
-        if is_meta_cdn(&src) {
-            media.push(Media::image(normalize_cdn_url(&src)));
+    // The embed uses img.img for both post photos and the author's avatar.
+    // AvatarContainer identifies profile images without guessing from sizes
+    // or changing signed CDN URLs. Check all ancestors for nested wrappers.
+    let image_selector = Selector::parse("img.img").ok()?;
+    for image in doc.select(&image_selector) {
+        if image.ancestors().filter_map(ElementRef::wrap).any(|ancestor| {
+            ancestor.value().classes().any(|class| class == "AvatarContainer")
+        }) {
+            continue;
+        }
+        let Some(src) = image.value().attr("src") else {
+            continue;
+        };
+        if is_meta_cdn(src) {
+            media.push(Media::image(normalize_cdn_url(src)));
         }
     }
     for src in all_attrs(&doc, "video, video source", "src") {
@@ -136,6 +148,55 @@ mod tests {
         assert_eq!(p.media[0].kind, MediaKind::Image);
         // HTML entity decoded; query string otherwise intact.
         assert!(p.media[0].url.contains("x=1&y=2"), "url={}", p.media[0].url);
+    }
+
+    #[test]
+    fn embed_excludes_avatar_preserving_post_images() {
+        // Representative structure captured from DdVO0fGCX-j's live embed.
+        let html = r#"<div class="OuterContainer">
+            <div class="AvatarContainer"><img class="img" alt="feel_pale"
+                width="36" height="36" src="https://scontent.cdninstagram.com/avatar.jpg"></div>
+            <div class="NameContainer">feel_pale</div>
+            <div class="BodyContainerNoThreadLine"><div class="SoloMediaContainer">
+                <div class="SingleInnerMediaContainer"><img class="img" draggable="false"
+                    src="https://scontent.cdninstagram.com/post.jpg?b=2&amp;a=1"></div>
+            </div></div>
+            <img class="img" width="36" height="36" src="https://scontent.cdninstagram.com/small-post.jpg">
+            <div class="BodyTextContainer">post caption</div>
+        </div>"#;
+        let p = parse_embed(html, "orig").unwrap();
+        assert_eq!(p.media.len(), 2);
+        assert_eq!(p.media[0].url, "https://scontent.cdninstagram.com/post.jpg?b=2&a=1");
+        assert_eq!(p.media[1].url, "https://scontent.cdninstagram.com/small-post.jpg");
+        assert_eq!(p.author.as_deref(), Some("feel_pale"));
+        assert_eq!(p.caption.as_deref(), Some("post caption"));
+    }
+
+    #[test]
+    fn embed_nested_avatar_does_not_turn_text_into_media() {
+        let avatar = r#"<div class="AvatarContainer extra"><a><span>
+            <img class="img" src="https://scontent.cdninstagram.com/avatar.jpg">
+            </span></a></div>"#;
+        assert!(parse_embed(avatar, "orig").is_none());
+        let html = format!("{avatar}<div class=\"BodyTextContainer\">text only</div>");
+        let p = parse_embed(&html, "orig").unwrap();
+        assert!(p.media.is_empty());
+        assert_eq!(p.caption.as_deref(), Some("text only"));
+    }
+
+    #[tokio::test]
+    #[ignore = "live public Threads request; post availability and markup can change"]
+    async fn live_reported_post_excludes_avatar() {
+        let scraper = ThreadsEmbedScraper::new(
+            reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap(),
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36".into(),
+            r#""Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126""#.into(),
+        );
+        let html = scraper.fetch("https://www.threads.com/@feel_pale/post/DdVO0fGCX-j/embed").await.unwrap();
+        assert!(html.contains("AvatarContainer"), "probe must include avatar markup");
+        let p = parse_embed(&html, "https://www.threads.com/@feel_pale/post/DdVO0fGCX-j").unwrap();
+        assert_eq!(p.media.len(), 1, "only the post photo, no avatar");
+        assert_eq!(p.media[0].kind, MediaKind::Image);
     }
 
     #[test]

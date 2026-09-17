@@ -304,6 +304,16 @@ fn cap_story_media(post: &mut Post, cap: Option<usize>) -> Option<(usize, usize)
 /// expire after 24 h and depend on the bot's login session, so their copy
 /// names those causes instead of the post-oriented "private / removed".
 fn failure_copy(job: &Job, error: &ExtractError) -> String {
+    if job.platform == Platform::Threads {
+        return match error {
+            ExtractError::Restricted => "🔒 This Threads post may require login or have audience restrictions. The bot's session may not have access.",
+            ExtractError::RateLimited => "⚠️ Threads is rate-limiting requests right now. Please try again later.",
+            ExtractError::Blocked => "⚠️ Threads denied access to this post. It may require login or have audience restrictions.",
+            ExtractError::NotFound => "🤷 Couldn't find that Threads post — it may be unavailable or removed.",
+            ExtractError::Transient(_) => "⚠️ Couldn't fetch that Threads post because of a temporary fetch error. Please try again later.",
+            ExtractError::Unavailable(_) => "⚠️ Couldn't read this Threads post. Its content may be unavailable or its page format may have changed.",
+        }.to_string();
+    }
     match (job.kind, error) {
         (ContentKind::Story, ExtractError::NotFound) => {
             "🤷 Couldn't find that story — it may have expired (stories last 24 h) or belong to a private account.".to_string()
@@ -607,6 +617,17 @@ mod story_tests {
     }
 
     #[test]
+    fn threads_only_reports_rate_limiting_for_http_429() {
+        let th = job(Platform::Threads, ContentKind::Post);
+        assert!(failure_copy(&th, &ExtractError::Restricted).contains("audience restrictions"));
+        assert!(failure_copy(&th, &ExtractError::RateLimited).contains("rate-limiting"));
+        for error in [ExtractError::Restricted, ExtractError::Blocked, ExtractError::NotFound,
+            ExtractError::Transient("timeout".into()), ExtractError::Unavailable("empty".into())] {
+            assert!(!failure_copy(&th, &error).contains("rate-limiting"));
+        }
+    }
+
+    #[test]
     fn story_failures_get_story_specific_copy() {
         let story = job(Platform::Instagram, ContentKind::Story);
         assert!(failure_copy(&story, &ExtractError::NotFound).contains("expired"));
@@ -619,7 +640,7 @@ mod story_tests {
         );
         let th = job(Platform::Threads, ContentKind::Post);
         assert!(failure_copy(&th, &ExtractError::Transient("x".into()))
-            .contains("Threads may be rate-limiting"));
+            .contains("temporary fetch error"));
     }
 
     #[test]

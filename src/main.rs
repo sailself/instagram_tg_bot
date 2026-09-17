@@ -9,6 +9,7 @@ mod media;
 mod metrics;
 mod queue;
 mod threads_share;
+mod threads_http;
 mod urls;
 
 use anyhow::Result;
@@ -35,6 +36,9 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(30))
         .user_agent(cfg.user_agent.clone())
         .build()?;
+
+    let (threads_http, threads_share_http) =
+        threads_http::clients(cfg.threads_cookies_path.as_deref())?;
 
     // Telegram API client with a generous request timeout: big media-group
     // sends (server-side URL fetches / multipart uploads) far outlast
@@ -69,11 +73,12 @@ async fn main() -> Result<()> {
             instagram: Arc::new(extract::build_ig_chain(&cfg, http.clone())),
             // Stories are login-walled: this chain exists only with cookies.
             instagram_story: extract::build_ig_story_chain(&cfg).map(Arc::new),
-            threads: Arc::new(extract::build_threads_chain(&cfg, http.clone())),
-            threads_share: Arc::new(threads_share::ThreadsShareResolver::new(
+            threads: Arc::new(extract::build_threads_chain(&cfg, threads_http)),
+            threads_share: Arc::new(threads_share::ThreadsShareResolver::with_client(
+                threads_share_http,
                 cfg.threads_user_agent.clone(),
                 cfg.threads_sec_ch_ua.clone(),
-            )?),
+            )),
         };
         let cfg = cfg.clone();
         let http = http.clone();

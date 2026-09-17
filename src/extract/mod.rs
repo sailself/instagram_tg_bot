@@ -57,6 +57,10 @@ pub enum ExtractError {
     NotFound,
     #[error("login or rate-limit wall")]
     Blocked,
+    #[error("login required or audience-restricted content")]
+    Restricted,
+    #[error("HTTP 429 rate limit")]
+    RateLimited,
     #[error("backend unavailable: {0}")]
     Unavailable(String),
     #[error("parse/transient error: {0}")]
@@ -248,6 +252,14 @@ pub(crate) fn map_status(code: u16) -> ExtractError {
     }
 }
 
+/// Threads distinguishes actual HTTP throttling from access denial and parsing.
+pub(crate) fn threads_status(code: u16) -> ExtractError {
+    match code {
+        429 => ExtractError::RateLimited,
+        _ => map_status(code),
+    }
+}
+
 /// Run `<path> --version` to check a subprocess backend is actually installed.
 /// Startup-only operator aid: `Ok(first line of output)` or `Err(reason)`.
 pub fn probe_binary(path: &str) -> Result<String, String> {
@@ -294,6 +306,8 @@ pub fn report_backend_binaries(cfg: &Config) {
 /// instead of letting a later empty-media `NotFound` mask an earlier `Blocked`.
 fn severity(e: &ExtractError) -> u8 {
     match e {
+        ExtractError::Restricted => 5,
+        ExtractError::RateLimited => 4,
         ExtractError::Blocked => 3,
         ExtractError::Transient(_) => 2,
         ExtractError::NotFound => 1,
@@ -440,9 +454,23 @@ mod tests {
         match e {
             ExtractError::NotFound => ExtractError::NotFound,
             ExtractError::Blocked => ExtractError::Blocked,
+            ExtractError::Restricted => ExtractError::Restricted,
+            ExtractError::RateLimited => ExtractError::RateLimited,
             ExtractError::Unavailable(s) => ExtractError::Unavailable(s.clone()),
             ExtractError::Transient(s) => ExtractError::Transient(s.clone()),
         }
+    }
+
+    #[tokio::test]
+    async fn restricted_failure_survives_embed_miss() {
+        let c = ExtractorChain::new_accepting_textonly(vec![
+            Box::new(Mock(Err(ExtractError::Restricted))),
+            Box::new(Mock(Err(ExtractError::Unavailable("empty embed".into())))),
+        ]);
+        assert!(matches!(c.extract("u", "s").await, Err(ExtractError::Restricted)));
+        assert!(matches!(threads_status(429), ExtractError::RateLimited));
+        assert!(matches!(threads_status(403), ExtractError::Blocked));
+        assert!(matches!(threads_status(503), ExtractError::Transient(_)));
     }
 
     #[tokio::test]

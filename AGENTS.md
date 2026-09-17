@@ -102,7 +102,7 @@ only (`threads_json` primary, `threads_embed` the `/embed`-HTML fallback).
   silent success.
 - **Cookieless-first.** Do NOT enable Instagram/Threads login/cookies or the
   external fallback by default — config-gated (`IG_COOKIES_PATH`,
-  `FALLBACK_PROVIDER`). Any cookie use is a disposable burner, never a real
+  `THREADS_COOKIES_PATH`, `FALLBACK_PROVIDER`). Any cookie use is a disposable burner, never a real
   account.
 - **Instagram Stories are login-walled — the story chain exists only with
   cookies.** Logged-out, `/stories/…` returns HTTP 200 + a login wall whose lone
@@ -164,8 +164,10 @@ keepalive against idle reclaim). The bot token and chat allowlist live in
 file must be **readable and writable by `botuser`**, so it lives under
 `/opt/igbot/` (the unit's `ReadWritePaths`), never `/etc/igbot/`: yt-dlp
 rewrites the jar on exit and exits non-zero when it can't, which the extractor
-reads as a failed run. Threads never consumes cookies — the file only feeds the
-Instagram chains. Upgrades go through `deploy/upgrade.sh [TAG]` (resolve →
+reads as a failed run. The IG file only feeds the Instagram chains unless explicitly also configured
+as `THREADS_COOKIES_PATH`. Threads cookies are read-only, loaded at startup,
+and domain/path/expiry scoped to HTTPS Threads requests; never attach them to
+the shared Instagram/CDN/Telegram client. Upgrades go through `deploy/upgrade.sh [TAG]` (resolve →
 verify checksum → byte-compare → swap → health-check → auto-rollback); the
 one-time gallery-dl setup for boxes older than v0.4.0 is
 `deploy/install-gallery-dl.sh` (idempotent; `setup.sh` calls it on fresh

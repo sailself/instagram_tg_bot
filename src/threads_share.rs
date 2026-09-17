@@ -1,7 +1,10 @@
-use crate::extract::{map_status, ExtractError};
+use crate::extract::{threads_status, ExtractError};
 use crate::urls::threads_post_url;
-use reqwest::{redirect::Policy, StatusCode};
+use reqwest::StatusCode;
+#[cfg(test)]
+use reqwest::redirect::Policy;
 use std::collections::HashSet;
+#[cfg(test)]
 use std::time::Duration;
 use url::Url;
 
@@ -18,16 +21,22 @@ pub struct ResolvedThreadsPost {
 pub struct ThreadsShareResolver {
     http: reqwest::Client,
     sec_ch_ua: String,
+    user_agent: String,
 }
 
 impl ThreadsShareResolver {
+    #[cfg(test)]
     pub fn new(user_agent: String, sec_ch_ua: String) -> Result<Self, reqwest::Error> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .redirect(Policy::none())
-            .user_agent(user_agent)
+            .user_agent(user_agent.clone())
             .build()?;
-        Ok(Self { http, sec_ch_ua })
+        Ok(Self { http, sec_ch_ua, user_agent })
+    }
+
+    pub fn with_client(http: reqwest::Client, user_agent: String, sec_ch_ua: String) -> Self {
+        Self { http, user_agent, sec_ch_ua }
     }
 
     pub async fn resolve(&self, share_url: &str) -> Result<ResolvedThreadsPost, ExtractError> {
@@ -36,6 +45,7 @@ impl ThreadsShareResolver {
             let response = self
                 .http
                 .get(state.request_url())
+                .header(reqwest::header::USER_AGENT, &self.user_agent)
                 .header(
                     reqwest::header::ACCEPT,
                     "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -97,7 +107,7 @@ impl RedirectState {
         location: Option<&str>,
     ) -> Result<Option<ResolvedThreadsPost>, ExtractError> {
         if !status.is_redirection() {
-            return Err(map_status(status.as_u16()));
+            return Err(threads_status(status.as_u16()));
         }
         let location = location.ok_or_else(|| {
             ExtractError::Transient("Threads share redirect missing Location".into())

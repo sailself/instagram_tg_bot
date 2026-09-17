@@ -53,7 +53,7 @@ impl ThreadsEmbedScraper {
             Ok(body)
         } else {
             tracing::debug!(status = status.as_u16(), "threads embed fetch non-success");
-            Err(super::map_status(status.as_u16()))
+            Err(super::threads_status(status.as_u16()))
         }
     }
 }
@@ -67,8 +67,18 @@ impl Extractor for ThreadsEmbedScraper {
     async fn extract(&self, url: &str, _shortcode: &str) -> Result<Post, ExtractError> {
         let embed_url = format!("{}/embed", url.trim_end_matches('/'));
         let html = self.fetch(&embed_url).await?;
-        parse_embed(&html, url).ok_or(ExtractError::NotFound)
+        parse_response(&html, url)
     }
+}
+
+fn parse_response(html: &str, url: &str) -> Result<Post, ExtractError> {
+    if let Some(post) = parse_embed(html, url) {
+        return Ok(post);
+    }
+    if super::threads_json::looks_login_walled(html) {
+        return Err(ExtractError::Restricted);
+    }
+    Err(ExtractError::Unavailable("Threads embed contains no recognized post content".into()))
 }
 
 /// Parse the SSR embed card: media from non-avatar `img.img` / `<video>` (CDN-gated),
@@ -188,7 +198,7 @@ mod tests {
     #[ignore = "live public Threads request; post availability and markup can change"]
     async fn live_reported_post_excludes_avatar() {
         let scraper = ThreadsEmbedScraper::new(
-            reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap(),
+            crate::threads_http::clients(None).unwrap().0,
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36".into(),
             r#""Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126""#.into(),
         );
@@ -197,6 +207,27 @@ mod tests {
         let p = parse_embed(&html, "https://www.threads.com/@feel_pale/post/DdVO0fGCX-j").unwrap();
         assert_eq!(p.media.len(), 1, "only the post photo, no avatar");
         assert_eq!(p.media[0].kind, MediaKind::Image);
+    }
+
+    #[tokio::test]
+    #[ignore = "live anonymous Threads audience-restriction probe"]
+    async fn live_audience_restriction_is_not_rate_limiting() {
+        let (http, share_http) = crate::threads_http::clients(None).unwrap();
+        let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+        let ch = r#""Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126""#;
+        let resolver = crate::threads_share::ThreadsShareResolver::with_client(share_http, ua.into(), ch.into());
+        let resolved = resolver.resolve("https://www.threads.com/share/BARWV10v9i/").await.unwrap();
+        let json = super::super::threads_json::ThreadsScraper::new(http.clone(), ua.into(), ch.into());
+        let embed = ThreadsEmbedScraper::new(http, ua.into(), ch.into());
+        assert!(matches!(json.extract(&resolved.canonical_url, &resolved.shortcode).await, Err(ExtractError::Restricted)));
+        assert!(matches!(embed.extract(&resolved.canonical_url, &resolved.shortcode).await, Err(ExtractError::Unavailable(_))));
+    }
+
+    #[test]
+    fn embed_response_distinguishes_wall_from_unrecognized_markup() {
+        assert!(matches!(parse_response("<h1>This content isn't available to everyone</h1>", "u"), Err(ExtractError::Restricted)));
+        assert!(matches!(parse_response("<script>Log in to see</script>", "u"), Err(ExtractError::Unavailable(_))));
+        assert!(parse_response("<div class=\"BodyTextContainer\">Log in to see</div>", "u").is_ok());
     }
 
     #[test]

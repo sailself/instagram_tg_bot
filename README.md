@@ -127,8 +127,8 @@ cd instagram_tg_bot
 
 # 2. download + verify the release binary
 cd /tmp
-base=igbot-v0.4.0-linux-x86_64.tar.gz
-url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.0
+base=igbot-v0.4.1-linux-x86_64.tar.gz
+url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.1
 curl -L -O "$url/$base" && curl -L -O "$url/$base.sha256"
 sha256sum -c "$base.sha256" && tar -xzf "$base"   # → /tmp/igbot
 
@@ -158,7 +158,7 @@ automatically** if the new one doesn't come up within ~20 s:
 ```bash
 cd ~/instagram_tg_bot && git pull
 sudo bash deploy/upgrade.sh              # newest release
-sudo bash deploy/upgrade.sh v0.4.0       # pin a tag — also how you roll back
+sudo bash deploy/upgrade.sh v0.4.1       # pin a tag — also how you roll back
 sudo bash deploy/upgrade.sh --dry-run    # resolve + download + verify + compare only
 ```
 
@@ -178,13 +178,13 @@ working defaults, so `igbot.env` usually needs no changes. Two exceptions:
   posts and Threads keep working exactly as before.
 
 **Manual equivalent** of the script, if you'd rather see each step (replace
-`v0.4.0` with the tag you're moving to):
+`v0.4.1` with the tag you're moving to):
 
 ```bash
 # 1. download + verify the new release
 cd /tmp
-base=igbot-v0.4.0-linux-x86_64.tar.gz
-url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.0
+base=igbot-v0.4.1-linux-x86_64.tar.gz
+url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.1
 curl -L -O "$url/$base" && curl -L -O "$url/$base.sha256"
 sha256sum -c "$base.sha256" && tar -xzf "$base" -C /tmp   # → /tmp/igbot
 
@@ -241,6 +241,7 @@ See [`.env.example`](.env.example) for everything. Key variables:
 | `TELEGRAM_BOT_TOKEN` | **required** — BotFather token |
 | `ALLOWED_CHAT_IDS` | comma-separated chat ids; empty = any chat |
 | `EMBED_USER_AGENT` | crawler UA for the IG embed scraper (hot-config) |
+| `THREADS_COOKIES_PATH` | Optional Netscape cookie export from a disposable Threads account; read-only, loaded at startup. Restart after replacement. Never enabled implicitly by `IG_COOKIES_PATH`. |
 | `THREADS_ENABLED` | set `0/false/no/off` to ignore Threads links (default on) |
 | `THREADS_USER_AGENT` / `THREADS_SEC_CH_UA` | desktop-browser UA + matching client-hint for the Threads scrape (hot-config) |
 | `RUST_LOG` | log filter (`igbot=info,warn` default; `igbot=debug` for detail) |
@@ -257,8 +258,8 @@ is a config change, not a recompile.
 
 The default chains are **cookieless**. You need this section only for
 **Instagram Stories / highlights** (login-walled) or to turn on the gallery-dl
-backstop for posts. **Threads never uses cookies**: its chain is an anonymous
-in-process scrape, and no code path reads Threads cookies today.
+backstop for posts. **Threads is anonymous by default**. Optional `THREADS_COOKIES_PATH` enables
+a read-only cookie snapshot for its in-process scrapers and share resolver.
 
 Rules first — getting these wrong burns an account or the bot's IP:
 
@@ -328,8 +329,8 @@ captures all of them.
 the same file, repeat the export while on
 [threads.com](https://www.threads.com) — a `cookies.txt` is multi-domain, and
 extra `.threads.com` / `.threads.net` lines are harmless. Just know that
-**nothing in the bot reads them today**; the Threads chain is cookieless by
-design and the file is only ever handed to the Instagram extractors.
+**Threads only reads them when `THREADS_COOKIES_PATH` is explicitly set**.
+`IG_COOKIES_PATH` alone does not enable Threads authentication.
 
 ### 2. Install it on the server
 
@@ -412,3 +413,27 @@ kills them immediately.
 - Bot API upload cap is 50 MB; larger videos get a link + note instead.
 - This scrapes public, logged-out content. Adding burner cookies is opt-in and
   disposable.
+
+### Optional Threads login session
+
+Export Netscape cookies while logged into **threads.com** with a disposable account.
+Install the file with mode `0600`, readable by `botuser`, and set in `/etc/igbot/igbot.env`:
+
+```ini
+THREADS_COOKIES_PATH=/opt/igbot/threads-cookies.txt
+```
+
+Restart `igbot` after setting the path or replacing the file. The startup summary
+shows `threads_cookies=true` without printing the path or values. A multi-domain
+file may be shared with `IG_COOKIES_PATH`, but each setting must be explicit.
+Only matching HTTPS Threads-domain cookies are sent; Instagram, CDN and Telegram
+requests do not receive them. Domain, path and expiry scope are respected.
+The bot reads at most 1 MiB, does not modify the file or save response cookies,
+and fails startup for an unreadable/malformed file or one with no unexpired
+Threads cookies. Re-export and restart when the session expires. Leave the
+setting unset for anonymous fetching.
+
+A session may help a post that opens for that account but is audience-restricted
+when logged out; it cannot grant access the account does not have. Restriction
+pages now produce a login/audience-restriction reply. Only an actual HTTP 429
+produces the Threads rate-limit reply; other fetch/format errors are separate.

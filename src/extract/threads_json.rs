@@ -15,7 +15,7 @@
 //! NB: the exact nesting for quote/repost (`text_post_app_info.share_info.*`) is
 //! best-effort and flagged for live validation; it degrades to the outer post.
 
-use super::{collect_meta_media, dedup_media, map_status, ExtractError, Extractor, Media, Post};
+use super::{collect_meta_media, dedup_media, ExtractError, Extractor, Media, Post};
 use async_trait::async_trait;
 use scraper::{Html, Selector};
 use serde_json::Value;
@@ -68,7 +68,7 @@ impl ThreadsScraper {
             Ok(body)
         } else {
             tracing::debug!(status = status.as_u16(), "threads fetch non-success");
-            Err(map_status(status.as_u16()))
+            Err(super::threads_status(status.as_u16()))
         }
     }
 }
@@ -80,8 +80,7 @@ impl Extractor for ThreadsScraper {
     }
 
     async fn extract(&self, url: &str, shortcode: &str) -> Result<Post, ExtractError> {
-        // Default to the most-actionable failure we can infer; an empty shell
-        // (the header gate) is treated as Blocked, not silent success.
+        // Retry an empty shell, but do not mistake missing data for a login wall.
         let mut last = ExtractError::Transient("threads: no data".into());
         for attempt in 0..MAX_ATTEMPTS {
             if attempt > 0 {
@@ -90,13 +89,17 @@ impl Extractor for ThreadsScraper {
             match self.fetch(url).await {
                 Ok(html) => match parse_threads_post(&html, shortcode, url) {
                     ParseOutcome::Post(post) => return Ok(post),
-                    ParseOutcome::LoginWalled => return Err(ExtractError::Blocked),
+                    ParseOutcome::LoginWalled => return Err(ExtractError::Restricted),
                     ParseOutcome::NotFound => return Err(ExtractError::NotFound),
                     ParseOutcome::EmptyShell => {
                         tracing::debug!(shortcode, attempt, "threads empty shell, retrying");
-                        last = ExtractError::Blocked;
+                        last = ExtractError::Unavailable("Threads returned no recognized post data".into());
                     }
                 },
+                Err(ExtractError::RateLimited) => {
+                    last = ExtractError::RateLimited;
+                    continue;
+                }
                 Err(ExtractError::Transient(e)) => {
                     last = ExtractError::Transient(e);
                     continue;
@@ -146,10 +149,10 @@ fn parse_threads_post(html: &str, shortcode: &str, original_url: &str) -> ParseO
         }
     }
 
-    if saw_thread_items {
-        ParseOutcome::NotFound
-    } else if looks_login_walled(html) {
+    if looks_login_walled(html) {
         ParseOutcome::LoginWalled
+    } else if saw_thread_items {
+        ParseOutcome::NotFound
     } else {
         ParseOutcome::EmptyShell
     }
@@ -278,12 +281,53 @@ fn quote_note(inner: &Value) -> Option<String> {
     }
 }
 
-fn looks_login_walled(html: &str) -> bool {
-    let l = html.to_ascii_lowercase();
-    l.contains("log in to see")
-        || l.contains("this account is private")
-        || l.contains("sorry, this page isn't available")
-        || l.contains("isn't available")
+pub(super) fn looks_login_walled(html: &str) -> bool {
+    let doc = Html::parse_document(html);
+    // Threads renders this audience wall client-side. Recognize the active
+    // route payload observed on DdWjmkgDnI3, not arbitrary bundle strings.
+    if let Ok(selector) = Selector::parse(r#"script[type="application/json"]"#) {
+        for script in doc.select(&selector) {
+            let text = script.text().collect::<String>();
+            if !text.contains("initialRouteInfo") { continue; }
+            if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                if has_restricted_route(&value) { return true; }
+            }
+        }
+    }
+    // Also inspect visible page text, never JS string tables or metadata.
+    let visible = doc.tree.nodes().filter_map(|node| {
+        let text = node.value().as_text()?;
+        if node.ancestors().filter_map(scraper::ElementRef::wrap).any(|e| {
+            matches!(e.value().name(), "script" | "style" | "template" | "head")
+                || e.value().attr("hidden").is_some()
+                || e.value().attr("aria-hidden") == Some("true")
+        }) { return None; }
+        Some(text.text.as_ref())
+    }).collect::<Vec<&str>>().join(" ");
+    let text = visible.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    text.contains("log in to see")
+        || text.contains("this account is private")
+        || text.contains("this content isn't available to everyone")
+        || text.contains("this content isn’t available to everyone")
+        || text.contains("it can't be seen by certain audiences")
+        || text.contains("it can’t be seen by certain audiences")
+}
+
+fn has_restricted_route(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            if let Some(route) = value.pointer("/initialRouteInfo/route") {
+                if route.get("tracePolicy").and_then(Value::as_str) == Some("barcelona.geoBlockPage")
+                    && route.pointer("/rootView/resource/__dr").and_then(Value::as_str)
+                        == Some("BarcelonaGeoBlockedErrorRoot.react") {
+                    return true;
+                }
+            }
+            map.values().any(has_restricted_route)
+        }
+        Value::Array(values) => values.iter().any(has_restricted_route),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -504,6 +548,34 @@ mod tests {
             parse_threads_post(&html, "SC", "u"),
             ParseOutcome::NotFound
         ));
+    }
+
+    #[test]
+    fn captured_audience_route_is_restricted_without_visible_html() {
+        // Reduced public payload from the reported BARWV10v9i share's target.
+        let html = script(r#"{"require":[{"initialRouteInfo":{"route":{
+            "rootView":{"resource":{"__dr":"BarcelonaGeoBlockedErrorRoot.react"},
+            "props":{"title":"This content isn't available to everyone","description":"It can't be seen by certain audiences."}},
+            "tracePolicy":"barcelona.geoBlockPage"}}}]}"#);
+        assert!(matches!(parse_threads_post(&html, "SC", "u"), ParseOutcome::LoginWalled));
+        let unused = script(r#"{"resources":["BarcelonaGeoBlockedErrorRoot.react"],"strings":["This content isn't available to everyone"]}"#);
+        assert!(matches!(parse_threads_post(&unused, "SC", "u"), ParseOutcome::EmptyShell));
+    }
+
+    #[test]
+    fn audience_wall_uses_visible_text_only() {
+        let wall = "<h1>This content isn't available to everyone</h1><p>It can't be seen by certain audiences. See Why</p>";
+        assert!(matches!(parse_threads_post(wall, "SC", "u"), ParseOutcome::LoginWalled));
+        let script_only = format!("<script>{wall}</script><template>{wall}</template><div hidden>{wall}</div>");
+        assert!(matches!(parse_threads_post(&script_only, "SC", "u"), ParseOutcome::EmptyShell));
+        assert!(!looks_login_walled("<p>Sorry, this page isn't available</p>"));
+    }
+
+    #[test]
+    fn available_post_takes_precedence_over_wall_phrases() {
+        let html = script(r#"{"thread_items":[{"post":{"code":"SC","caption":{"text":"log in to see is just a phrase"},"user":{"username":"u"}}}]}"#);
+        let html = format!("{html}<p>Log in to see more posts</p>");
+        assert!(post(&html, "SC").is_some());
     }
 
     #[test]

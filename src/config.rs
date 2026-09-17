@@ -37,6 +37,7 @@ pub struct Config {
     pub yt_dlp_path: String,
     pub gallery_dl_path: String,
     pub ig_cookies_path: Option<String>,
+    pub threads_cookies_path: Option<String>,
     /// e.g. "embedez" | "jina"; `None` keeps the external fallback disabled.
     pub fallback_provider: Option<String>,
     pub jina_api_key: Option<String>,
@@ -89,6 +90,7 @@ impl Config {
             yt_dlp_path: opt("YT_DLP_PATH").unwrap_or_else(|| "yt-dlp".into()),
             gallery_dl_path: opt("GALLERY_DL_PATH").unwrap_or_else(|| "gallery-dl".into()),
             ig_cookies_path: opt("IG_COOKIES_PATH"),
+            threads_cookies_path: opt("THREADS_COOKIES_PATH"),
             fallback_provider: opt("FALLBACK_PROVIDER").map(|s| s.to_lowercase()),
             jina_api_key: opt("JINA_API_KEY"),
             user_agent: opt("USER_AGENT").unwrap_or_else(|| DEFAULT_UA.into()),
@@ -121,7 +123,7 @@ impl Config {
     pub fn summary(&self) -> String {
         format!(
             "allowed_chats={} queue_cap={} cache_ttl={}s job_timeout={}s send_timeout={}s pacing={}ms \
-max_upload={}MB cookies={} fallback={} threads={} stories={} story_max={} jina_key={} heartbeat={} \
+max_upload={}MB cookies={} fallback={} threads={} threads_cookies={} stories={} story_max={} jina_key={} heartbeat={} \
 embed_ua={:?}",
             self.allowed_chats.len(),
             self.queue_capacity,
@@ -133,6 +135,7 @@ embed_ua={:?}",
             self.ig_cookies_path.is_some(),
             self.fallback_provider.as_deref().unwrap_or("none"),
             self.threads_enabled,
+            self.threads_cookies_path.is_some(),
             self.ig_stories_enabled,
             self.ig_story_max_items
                 .map_or_else(|| "unlimited".to_string(), |n| n.to_string()),
@@ -153,6 +156,7 @@ embed_ua={:?}",
             yt_dlp_path: "yt-dlp".into(),
             gallery_dl_path: "gallery-dl".into(),
             ig_cookies_path: None,
+            threads_cookies_path: None,
             fallback_provider: None,
             jina_api_key: None,
             user_agent: "ua".into(),
@@ -257,6 +261,8 @@ mod tests {
         c.bot_token = "123456:SUPER-SECRET-TOKEN".into();
         c.ig_cookies_path = Some("/etc/igbot/cookies-SECRET.txt".into());
         c.jina_api_key = Some("jina-key-SECRET".into());
+        assert!(c.threads_cookies_path.is_none());
+        c.threads_cookies_path = Some("threads-SECRET.txt".into());
         let s = c.summary();
         assert!(!s.contains("SUPER-SECRET-TOKEN"), "token leaked: {s}");
         assert!(!s.contains("cookies-SECRET.txt"), "cookies path leaked: {s}");
@@ -264,6 +270,8 @@ mod tests {
         // The non-secret booleans/values are still present.
         assert!(s.contains("cookies=true"));
         assert!(s.contains("jina_key=true"));
+        assert!(s.contains("threads_cookies=true"));
+        assert!(!s.contains("threads-SECRET"));
     }
 
     #[test]

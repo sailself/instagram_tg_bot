@@ -114,6 +114,8 @@ pub enum ExtractError {
 pub trait Extractor: Send + Sync {
     /// Short name for logging ("embed", "yt-dlp", "threads-json", ...).
     fn name(&self) -> &'static str;
+    // async_trait adds #[must_use] to its already-must-use boxed Future.
+    #[allow(clippy::double_must_use)]
     async fn extract(&self, url: &str, shortcode: &str) -> Result<Post, ExtractError>;
 }
 

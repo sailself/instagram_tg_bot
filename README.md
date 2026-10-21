@@ -138,8 +138,8 @@ cd instagram_tg_bot
 
 # 2. download + verify the release binary
 cd /tmp
-base=igbot-v0.4.2-linux-x86_64.tar.gz
-url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.2
+base=igbot-v0.4.3-linux-x86_64.tar.gz
+url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.3
 curl -L -O "$url/$base" && curl -L -O "$url/$base.sha256"
 sha256sum -c "$base.sha256" && tar -xzf "$base"   # → /tmp/igbot
 
@@ -169,7 +169,7 @@ automatically** if the new one doesn't come up within ~20 s:
 ```bash
 cd ~/instagram_tg_bot && git pull
 sudo bash deploy/upgrade.sh              # newest release
-sudo bash deploy/upgrade.sh v0.4.2       # pin a tag — also how you roll back
+sudo bash deploy/upgrade.sh v0.4.3       # pin a tag — also how you roll back
 sudo bash deploy/upgrade.sh --dry-run    # resolve + download + verify + compare only
 ```
 
@@ -189,13 +189,13 @@ working defaults, so `igbot.env` usually needs no changes. Two exceptions:
   posts and Threads keep working exactly as before.
 
 **Manual equivalent** of the script, if you'd rather see each step (replace
-`v0.4.2` with the tag you're moving to):
+`v0.4.3` with the tag you're moving to):
 
 ```bash
 # 1. download + verify the new release
 cd /tmp
-base=igbot-v0.4.2-linux-x86_64.tar.gz
-url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.2
+base=igbot-v0.4.3-linux-x86_64.tar.gz
+url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.3
 curl -L -O "$url/$base" && curl -L -O "$url/$base.sha256"
 sha256sum -c "$base.sha256" && tar -xzf "$base" -C /tmp   # → /tmp/igbot
 

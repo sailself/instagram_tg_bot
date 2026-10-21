@@ -311,6 +311,7 @@ fn failure_copy(job: &Job, error: &ExtractError) -> String {
             ExtractError::Blocked => "⚠️ Threads denied access to this post. It may require login or have audience restrictions.",
             ExtractError::NotFound => "🤷 Couldn't find that Threads post — it may be unavailable or removed.",
             ExtractError::Transient(_) => "⚠️ Couldn't fetch that Threads post because of a temporary fetch error. Please try again later.",
+            ExtractError::IncompleteMedia(_) => return format!("⚠️ Found this Threads post, but couldn't retrieve all its attachments. Open the original link to view the media, or try again later.\n\n🔗 {}", job.original_url),
             ExtractError::Unavailable(_) => "⚠️ Couldn't read this Threads post. Its content may be unavailable or its page format may have changed.",
         }.to_string();
     }
@@ -617,12 +618,33 @@ mod story_tests {
     }
 
     #[test]
+    fn incomplete_threads_copy_preserves_original_link_and_explains_retry() {
+        let mut th = job(Platform::Threads, ContentKind::Post);
+        th.original_url = "https://www.threads.com/@user/post/POST".into();
+        let error = ExtractError::IncompleteMedia(crate::extract::MediaRequirements {
+            total: 2,
+            images: 1,
+            videos: 1,
+        });
+        let copy = failure_copy(&th, &error);
+        assert!(copy.contains("all its attachments"));
+        assert!(copy.contains("try again later"));
+        assert!(copy.ends_with(&format!("🔗 {}", th.original_url)));
+        assert!(!copy.contains("rate-limiting"));
+    }
+
+    #[test]
     fn threads_only_reports_rate_limiting_for_http_429() {
         let th = job(Platform::Threads, ContentKind::Post);
         assert!(failure_copy(&th, &ExtractError::Restricted).contains("audience restrictions"));
         assert!(failure_copy(&th, &ExtractError::RateLimited).contains("rate-limiting"));
-        for error in [ExtractError::Restricted, ExtractError::Blocked, ExtractError::NotFound,
-            ExtractError::Transient("timeout".into()), ExtractError::Unavailable("empty".into())] {
+        for error in [
+            ExtractError::Restricted,
+            ExtractError::Blocked,
+            ExtractError::NotFound,
+            ExtractError::Transient("timeout".into()),
+            ExtractError::Unavailable("empty".into()),
+        ] {
             assert!(!failure_copy(&th, &error).contains("rate-limiting"));
         }
     }

@@ -3,11 +3,11 @@
 //! private-API JSON server-side inside `<script type="application/json">`
 //! (`data-sjs`) blocks — BUT only when sent a coherent desktop-browser header
 //! set; a crawler/naive UA gets an empty SPA shell (HTTP 200, zero
-//! `thread_items`), which we classify as a failure, never silent success.
+//! recognized target records), which we classify as a failure, never silent success.
 //!
 //! The JSON reuses Instagram's Polaris/Barcelona shape (`code`, `media_type`,
 //! `image_versions2`, `video_versions`, `carousel_media`, `caption.text`,
-//! `user.username`), so media collection is shared via [`collect_meta_media`].
+//! `user.username`), so media collection is shared via [`collect_meta_media_strict`].
 //! An Instagram post shared inline to Threads rides along as a full Polaris
 //! node under `text_post_app_info/linked_inline_media` (observed live); its
 //! media is appended after the post's own via [`collect_threads_media`].
@@ -15,7 +15,10 @@
 //! NB: the exact nesting for quote/repost (`text_post_app_info.share_info.*`) is
 //! best-effort and flagged for live validation; it degrades to the outer post.
 
-use super::{collect_meta_media, dedup_media, ExtractError, Extractor, Media, Post};
+use super::{
+    collect_meta_media_strict, dedup_media, ExtractError, Extractor, MediaRequirements,
+    MetaMediaCollection, Post,
+};
 use async_trait::async_trait;
 use scraper::{Html, Selector};
 use serde_json::Value;
@@ -31,7 +34,11 @@ pub struct ThreadsScraper {
 
 impl ThreadsScraper {
     pub fn new(http: reqwest::Client, user_agent: String, sec_ch_ua: String) -> Self {
-        Self { http, user_agent, sec_ch_ua }
+        Self {
+            http,
+            user_agent,
+            sec_ch_ua,
+        }
     }
 
     /// Fetch the post page with a *coherent* desktop-browser header set — the
@@ -64,7 +71,11 @@ impl ThreadsScraper {
                 .text()
                 .await
                 .map_err(|e| ExtractError::Transient(format!("threads body: {e}")))?;
-            tracing::debug!(status = status.as_u16(), bytes = body.len(), "threads fetch ok");
+            tracing::debug!(
+                status = status.as_u16(),
+                bytes = body.len(),
+                "threads fetch ok"
+            );
             Ok(body)
         } else {
             tracing::debug!(status = status.as_u16(), "threads fetch non-success");
@@ -90,10 +101,14 @@ impl Extractor for ThreadsScraper {
                 Ok(html) => match parse_threads_post(&html, shortcode, url) {
                     ParseOutcome::Post(post) => return Ok(post),
                     ParseOutcome::LoginWalled => return Err(ExtractError::Restricted),
-                    ParseOutcome::NotFound => return Err(ExtractError::NotFound),
+                    ParseOutcome::Incomplete(required) => {
+                        return Err(ExtractError::IncompleteMedia(required))
+                    }
                     ParseOutcome::EmptyShell => {
                         tracing::debug!(shortcode, attempt, "threads empty shell, retrying");
-                        last = ExtractError::Unavailable("Threads returned no recognized post data".into());
+                        last = ExtractError::Unavailable(
+                            "Threads returned no recognized post data".into(),
+                        );
                     }
                 },
                 Err(ExtractError::RateLimited) => {
@@ -120,65 +135,115 @@ enum ParseOutcome {
     EmptyShell,
     /// The page is a login / private wall.
     LoginWalled,
-    /// Post data was present but our shortcode's post wasn't in it.
-    NotFound,
+    /// A target exists but known attachments could not be resolved.
+    Incomplete(MediaRequirements),
 }
 
-/// Scan the `application/json` blobs for `thread_items`, locate the post whose
-/// `code` matches `shortcode`, and build a [`Post`].
+/// Inspect each JSON script once, independently of Relay operation/envelope names.
+/// Recommendations are not evidence that the requested post was removed.
 fn parse_threads_post(html: &str, shortcode: &str, original_url: &str) -> ParseOutcome {
     let doc = Html::parse_document(html);
     let Ok(sel) = Selector::parse(r#"script[type="application/json"]"#) else {
         return ParseOutcome::EmptyShell;
     };
-
-    let mut saw_thread_items = false;
+    let mut posts: Vec<((usize, usize), Post)> = Vec::new();
+    let mut incomplete = false;
+    let mut required = MediaRequirements::default();
+    let mut parsed_scripts = 0;
+    let mut targets = 0;
     for script in doc.select(&sel) {
         let text = script.text().collect::<String>();
-        if !text.contains("thread_items") {
-            continue;
-        }
-        saw_thread_items = true;
         let Ok(value) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
-        if let Some(node) = find_thread_post(&value, shortcode) {
-            if let Some(post) = build_post(node, original_url) {
-                return ParseOutcome::Post(post);
+        parsed_scripts += 1;
+        let mut candidates = Vec::new();
+        find_thread_posts(&value, shortcode, &mut candidates);
+        targets += candidates.len();
+        for node in candidates {
+            match build_post(node, original_url) {
+                Ok(Some(post)) => {
+                    // A full Polaris record outranks a caption/user-only reference.
+                    // Never merge candidates: that can duplicate or mix attachments.
+                    let score = candidate_score(node, &post);
+                    posts.push((score, post));
+                }
+                Err(missing) => {
+                    incomplete = true;
+                    required.merge(missing);
+                }
+                Ok(None) => {}
             }
         }
     }
-
+    tracing::debug!(
+        parsed_scripts,
+        targets,
+        incomplete,
+        "threads JSON source shape"
+    );
+    posts.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+    for (_, post) in posts {
+        // An incomplete full record must not be hidden by a text-only stub.
+        if required.is_satisfied_by(&post.media) {
+            return ParseOutcome::Post(post);
+        }
+    }
     if looks_login_walled(html) {
         ParseOutcome::LoginWalled
-    } else if saw_thread_items {
-        ParseOutcome::NotFound
+    } else if incomplete {
+        ParseOutcome::Incomplete(required)
     } else {
         ParseOutcome::EmptyShell
     }
 }
 
-/// Recursively locate the post object whose `code` equals `shortcode`. Lenient
-/// (unlike the IG finder): a text-only Threads post carries no media keys, so we
-/// match on `code` plus any "looks like a post" key.
-fn find_thread_post<'a>(v: &'a Value, shortcode: &str) -> Option<&'a Value> {
+fn candidate_score(node: &Value, post: &Post) -> (usize, usize) {
+    // Actual resolved attachment evidence outranks caption-only projections,
+    // even if the projection happens to include a media_type discriminator.
+    let structure = usize::from(node.get("media_type").and_then(Value::as_u64).is_some())
+        + usize::from(author_of(node).is_some())
+        + usize::from(caption_of(node).is_some())
+        + usize::from(node.get("text_post_app_info").is_some());
+    (post.media.len(), structure)
+}
+
+/// Exact-code discovery stops at a post boundary. Embedded originals are only
+/// interpreted by build_post, never promoted to standalone target candidates.
+fn find_thread_posts<'a>(v: &'a Value, shortcode: &str, out: &mut Vec<&'a Value>) {
     match v {
         Value::Object(map) => {
             if map.get("code").and_then(Value::as_str) == Some(shortcode)
-                && (map.contains_key("pk")
-                    || map.contains_key("caption")
-                    || map.contains_key("user")
-                    || map.contains_key("media_type")
-                    || map.contains_key("image_versions2")
-                    || map.contains_key("carousel_media")
-                    || map.contains_key("video_versions"))
+                && [
+                    "pk",
+                    "caption",
+                    "user",
+                    "media_type",
+                    "image_versions2",
+                    "carousel_media",
+                    "video_versions",
+                ]
+                .iter()
+                .any(|key| map.contains_key(*key))
             {
-                return Some(v);
+                out.push(v);
+                return;
             }
-            map.values().find_map(|child| find_thread_post(child, shortcode))
+            for (key, child) in map {
+                if !matches!(
+                    key.as_str(),
+                    "quoted_post" | "reposted_post" | "linked_inline_media"
+                ) {
+                    find_thread_posts(child, shortcode, out);
+                }
+            }
         }
-        Value::Array(arr) => arr.iter().find_map(|child| find_thread_post(child, shortcode)),
-        _ => None,
+        Value::Array(arr) => {
+            for child in arr {
+                find_thread_posts(child, shortcode, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -186,26 +251,80 @@ fn find_thread_post<'a>(v: &'a Value, shortcode: &str) -> Option<&'a Value> {
 /// inline (`text_post_app_info/linked_inline_media` — a full Polaris media
 /// node riding along; observed live on share-to-Threads posts, where
 /// `share_info.quoted_post`/`reposted_post` stay null). Own media first.
-fn collect_threads_media(node: &Value) -> Vec<Media> {
-    let mut media = collect_meta_media(node);
-    if let Some(linked) = node
+fn collect_threads_media(node: &Value) -> MetaMediaCollection {
+    let mut media = collect_meta_media_strict(node);
+    let mut linked = node
         .pointer("/text_post_app_info/linked_inline_media")
         .filter(|n| n.is_object())
-    {
-        media.extend(collect_meta_media(linked));
+        .map(collect_meta_media_strict);
+    if let Some(linked) = &mut linked {
+        // An explicit linked-media stub still identifies an attachment.
+        linked.required.total = linked.required.total.max(1);
     }
+    if let Some(card) = node
+        .pointer("/text_post_app_info/link_preview_attachment/url")
+        .and_then(Value::as_str)
+        .and_then(super::threads_embed::instagram_attachment_requirements)
+    {
+        let linked = linked.get_or_insert(MetaMediaCollection {
+            media: Vec::new(),
+            required: MediaRequirements::default(),
+            incomplete: true,
+        });
+        // The card describes this same linked attachment, including when its
+        // inline object is only an empty stub. Merge rather than count twice.
+        linked.required.merge(card);
+    }
+    if let Some(linked) = linked {
+        media.media.extend(linked.media);
+        media.required.total += linked.required.total;
+        media.required.images += linked.required.images;
+        media.required.videos += linked.required.videos;
+    }
+    // URL dedup applies to evidence as well as delivery. Preserve only the
+    // unresolved deficit in addition to distinct usable attachments.
+    let before_images = media
+        .media
+        .iter()
+        .filter(|m| m.kind == super::MediaKind::Image)
+        .count();
+    let before_videos = media.media.len() - before_images;
+    let before_total = media.media.len();
+    media.media = dedup_media(media.media);
+    let after_images = media
+        .media
+        .iter()
+        .filter(|m| m.kind == super::MediaKind::Image)
+        .count();
+    let after_videos = media.media.len() - after_images;
+    media.required.total = media
+        .required
+        .total
+        .saturating_sub(before_total - media.media.len());
+    media.required.images = media
+        .required
+        .images
+        .saturating_sub(before_images - after_images);
+    media.required.videos = media
+        .required
+        .videos
+        .saturating_sub(before_videos - after_videos);
+    media.incomplete = !media.required.is_satisfied_by(&media.media);
     media
 }
 
 /// Build a [`Post`] from a matched node, resolving reposts/quotes (Threads
 /// design: a pure repost → mirror the original; a quote-post → outer content +
 /// a link/attribution to the inner post).
-fn build_post(node: &Value, original_url: &str) -> Option<Post> {
-    let media = collect_threads_media(node);
+fn build_post(node: &Value, original_url: &str) -> Result<Option<Post>, MediaRequirements> {
+    let collected = collect_threads_media(node);
+    if collected.incomplete {
+        return Err(collected.required);
+    }
+    let media = collected.media;
     let mut caption = caption_of(node);
     let author = author_of(node);
-    let has_own =
-        !media.is_empty() || caption.as_deref().is_some_and(|c| !c.trim().is_empty());
+    let has_own = !media.is_empty() || caption.as_deref().is_some_and(|c| !c.trim().is_empty());
 
     if has_own {
         // Quote-post: outer has its own content AND embeds another post — append
@@ -216,30 +335,36 @@ fn build_post(node: &Value, original_url: &str) -> Option<Post> {
                 _ => note,
             });
         }
-        return Some(Post {
+        return Ok(Some(Post {
             author,
             caption,
             media: dedup_media(media),
             original_url: original_url.to_string(),
-        });
+        }));
     }
 
     // Pure repost: the outer post is empty — mirror the inner (original) post.
     if let Some(inner) = inner_post(node) {
-        let inner_media = collect_threads_media(inner);
+        let collected = collect_threads_media(inner);
+        if collected.incomplete {
+            return Err(collected.required);
+        }
+        let inner_media = collected.media;
         let inner_caption = caption_of(inner);
         if !inner_media.is_empty()
-            || inner_caption.as_deref().is_some_and(|c| !c.trim().is_empty())
+            || inner_caption
+                .as_deref()
+                .is_some_and(|c| !c.trim().is_empty())
         {
-            return Some(Post {
+            return Ok(Some(Post {
                 author: author_of(inner),
                 caption: inner_caption,
                 media: dedup_media(inner_media),
                 original_url: original_url.to_string(),
-            });
+            }));
         }
     }
-    None
+    Ok(None)
 }
 
 fn caption_of(node: &Value) -> Option<String> {
@@ -288,23 +413,42 @@ pub(super) fn looks_login_walled(html: &str) -> bool {
     if let Ok(selector) = Selector::parse(r#"script[type="application/json"]"#) {
         for script in doc.select(&selector) {
             let text = script.text().collect::<String>();
-            if !text.contains("initialRouteInfo") { continue; }
+            if !text.contains("initialRouteInfo") {
+                continue;
+            }
             if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                if has_restricted_route(&value) { return true; }
+                if has_restricted_route(&value) {
+                    return true;
+                }
             }
         }
     }
     // Also inspect visible page text, never JS string tables or metadata.
-    let visible = doc.tree.nodes().filter_map(|node| {
-        let text = node.value().as_text()?;
-        if node.ancestors().filter_map(scraper::ElementRef::wrap).any(|e| {
-            matches!(e.value().name(), "script" | "style" | "template" | "head")
-                || e.value().attr("hidden").is_some()
-                || e.value().attr("aria-hidden") == Some("true")
-        }) { return None; }
-        Some(text.text.as_ref())
-    }).collect::<Vec<&str>>().join(" ");
-    let text = visible.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    let visible = doc
+        .tree
+        .nodes()
+        .filter_map(|node| {
+            let text = node.value().as_text()?;
+            if node
+                .ancestors()
+                .filter_map(scraper::ElementRef::wrap)
+                .any(|e| {
+                    matches!(e.value().name(), "script" | "style" | "template" | "head")
+                        || e.value().attr("hidden").is_some()
+                        || e.value().attr("aria-hidden") == Some("true")
+                })
+            {
+                return None;
+            }
+            Some(text.text.as_ref())
+        })
+        .collect::<Vec<&str>>()
+        .join(" ");
+    let text = visible
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
     text.contains("log in to see")
         || text.contains("this account is private")
         || text.contains("this content isn't available to everyone")
@@ -317,9 +461,13 @@ fn has_restricted_route(value: &Value) -> bool {
     match value {
         Value::Object(map) => {
             if let Some(route) = value.pointer("/initialRouteInfo/route") {
-                if route.get("tracePolicy").and_then(Value::as_str) == Some("barcelona.geoBlockPage")
-                    && route.pointer("/rootView/resource/__dr").and_then(Value::as_str)
-                        == Some("BarcelonaGeoBlockedErrorRoot.react") {
+                if route.get("tracePolicy").and_then(Value::as_str)
+                    == Some("barcelona.geoBlockPage")
+                    && route
+                        .pointer("/rootView/resource/__dr")
+                        .and_then(Value::as_str)
+                        == Some("BarcelonaGeoBlockedErrorRoot.react")
+                {
                     return true;
                 }
             }
@@ -344,6 +492,225 @@ mod tests {
 
     fn script(json: &str) -> String {
         format!(r#"<html><body><script type="application/json">{json}</script></body></html>"#)
+    }
+
+    fn data_media(node: Value) -> String {
+        script(
+            &serde_json::json!({"require":[{"__bbox":{"result":{"data":{"media":node}}}}]})
+                .to_string(),
+        )
+    }
+
+    #[test]
+    fn captured_new_envelope_ignores_separate_recommendations() {
+        let html = include_str!("../../tests/fixtures/threads_json_data_media.html");
+        let p = post(html, "SC").unwrap();
+        assert_eq!(p.author.as_deref(), Some("example.author"));
+        assert_eq!(p.media.len(), 1);
+        assert_eq!(p.media[0].kind, MediaKind::Video);
+        assert_eq!(
+            p.media[0].url,
+            "https://scontent.cdninstagram.com/v/linked.mp4?efg=example&oe=EXAMPLE&x=1%2B2"
+        );
+    }
+
+    #[test]
+    fn new_envelope_native_and_linked_media_families() {
+        let image = serde_json::json!({"media_type":1,"image_versions2":{"candidates":[{"url":"https://scontent.cdninstagram.com/v/photo.jpg?a=1&amp;b=2"}]}});
+        let video = serde_json::json!({"media_type":2,"video_versions":[{"url":"https://scontent.cdninstagram.com/v/video.mp4"}]});
+        let carousel =
+            serde_json::json!({"media_type":8,"carousel_media":[image.clone(),video.clone()]});
+        for (attachment, kinds) in [
+            (image, vec![MediaKind::Image]),
+            (video, vec![MediaKind::Video]),
+            (carousel, vec![MediaKind::Image, MediaKind::Video]),
+        ] {
+            for linked in [false, true] {
+                let mut node = serde_json::json!({"code":"SC","media_type":19,"caption":{"text":"outer text"},"user":{"username":"outer"}});
+                if linked {
+                    node["text_post_app_info"] =
+                        serde_json::json!({"linked_inline_media":attachment});
+                } else {
+                    for (key, value) in attachment.as_object().unwrap() {
+                        node[key] = value.clone();
+                    }
+                }
+                let p = post(&data_media(node), "SC").unwrap();
+                assert_eq!(p.media.iter().map(|m| m.kind).collect::<Vec<_>>(), kinds);
+                assert_eq!(p.author.as_deref(), Some("outer"));
+                assert_eq!(p.caption.as_deref(), Some("outer text"));
+                if p.media[0].kind == MediaKind::Image {
+                    assert!(p.media[0].url.ends_with("?a=1&b=2"));
+                }
+            }
+        }
+        let p = post(
+            &data_media(
+                serde_json::json!({"code":"SC","media_type":19,"caption":{"text":"text only"}}),
+            ),
+            "SC",
+        )
+        .unwrap();
+        assert!(p.media.is_empty());
+    }
+
+    #[test]
+    fn complete_target_beats_duplicate_stubs_across_and_within_scripts() {
+        let stub =
+            serde_json::json!({"code":"SC","caption":{"text":"stub"},"user":{"username":"u"}});
+        let full = serde_json::json!({"code":"SC","media_type":2,"caption":{"text":"complete"},"video_versions":[{"url":"https://scontent.cdninstagram.com/v/full.mp4"}]});
+        for html in [
+            format!("{}{}", data_media(stub.clone()), data_media(full.clone())),
+            script(&serde_json::json!({"records":[stub,full]}).to_string()),
+        ] {
+            let p = post(&html, "SC").unwrap();
+            assert_eq!(p.caption.as_deref(), Some("complete"));
+            assert_eq!(p.media[0].kind, MediaKind::Video);
+        }
+    }
+
+    #[test]
+    fn actual_attachment_evidence_beats_typed_text_and_smaller_projections() {
+        let video = serde_json::json!({"code":"SC","video_versions":[{"url":"https://scontent.cdninstagram.com/v/real.mp4"}]});
+        for first in [
+            serde_json::json!({"code":"SC","media_type":19,"caption":{"text":"typed stub"}}),
+            serde_json::json!({"code":"SC","media_type":2,"video_versions":[]}),
+        ] {
+            let html = format!("{}{}", data_media(first), data_media(video.clone()));
+            assert_eq!(post(&html, "SC").unwrap().media[0].kind, MediaKind::Video);
+        }
+        let child = serde_json::json!({"image_versions2":{"candidates":[{"url":"https://scontent.cdninstagram.com/v/one.jpg"}]}});
+        let small =
+            serde_json::json!({"code":"SC","media_type":8,"carousel_media":[child.clone()]});
+        let large = serde_json::json!({"code":"SC","media_type":8,"carousel_media":[child,{"video_versions":[{"url":"https://scontent.cdninstagram.com/v/two.mp4"}]}]});
+        let html = format!("{}{}", data_media(small), data_media(large));
+        assert_eq!(post(&html, "SC").unwrap().media.len(), 2);
+    }
+
+    #[test]
+    fn instagram_preview_without_resolved_inline_node_is_incomplete() {
+        for inline in [
+            Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"code":"IG","caption":{"text":"not media"}}),
+        ] {
+            for path in ["reel/Clip", "p/Photo"] {
+                let node = serde_json::json!({"code":"SC","media_type":19,"caption":{"text":"share"},"text_post_app_info":{"linked_inline_media":inline,"link_preview_attachment":{"url":format!("https://www.instagram.com/{path}/")}}});
+                match parse_threads_post(&data_media(node), "SC", "u") {
+                    ParseOutcome::Incomplete(required) => {
+                        assert_eq!(required.total, 1);
+                        assert_eq!(required.videos, usize::from(path.starts_with("reel")));
+                    }
+                    other => panic!("expected unresolved IG preview, got {other:?}"),
+                }
+            }
+        }
+        let external = serde_json::json!({"code":"SC","media_type":19,"caption":{"text":"article"},"text_post_app_info":{"link_preview_attachment":{"url":"https://example.com/article"}}});
+        assert!(post(&data_media(external), "SC").unwrap().media.is_empty());
+        let complete = serde_json::json!({"code":"SC","media_type":19,"text_post_app_info":{"link_preview_attachment":{"url":"https://www.instagram.com/reel/Clip/"},"linked_inline_media":{"media_type":2,"video_versions":[{"url":"https://scontent.cdninstagram.com/v/clip.mp4"}]}}});
+        assert_eq!(post(&data_media(complete), "SC").unwrap().media.len(), 1);
+    }
+
+    #[test]
+    fn partial_target_cannot_hide_behind_text_stub_or_wrong_kind() {
+        let partial = serde_json::json!({"code":"SC","media_type":2,"caption":{"text":"video unavailable"},"video_versions":[]});
+        for candidate in [
+            serde_json::json!({"code":"SC","caption":{"text":"stub"}}),
+            serde_json::json!({"code":"SC","media_type":1,"image_versions2":{"candidates":[{"url":"https://scontent.cdninstagram.com/v/photo.jpg"}]}}),
+        ] {
+            let html = format!("{}{}", data_media(candidate), data_media(partial.clone()));
+            assert!(matches!(
+                parse_threads_post(&html, "SC", "u"),
+                ParseOutcome::Incomplete(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_missing_and_nested_target_data_never_claim_deletion() {
+        for html in [
+            script("{invalid thread_items"),
+            data_media(serde_json::json!({"code":"SC"})),
+            data_media(
+                serde_json::json!({"code":"OTHER","text_post_app_info":{"share_info":{"quoted_post":{"code":"SC","caption":{"text":"inner"}}}}}),
+            ),
+        ] {
+            assert!(matches!(
+                parse_threads_post(&html, "SC", "u"),
+                ParseOutcome::EmptyShell
+            ));
+        }
+    }
+
+    #[test]
+    fn new_envelope_reposts_and_quotes_preserve_policy() {
+        let inner = serde_json::json!({"code":"INNER","media_type":19,"caption":{"text":"original"},"user":{"username":"original"},"text_post_app_info":{"linked_inline_media":{"media_type":2,"video_versions":[{"url":"https://scontent.cdninstagram.com/v/original.mp4"}]}}});
+        let repost = serde_json::json!({"code":"SC","user":{"username":"reposter"},"text_post_app_info":{"share_info":{"reposted_post":inner.clone()}}});
+        let p = post(&data_media(repost), "SC").unwrap();
+        assert_eq!(p.author.as_deref(), Some("original"));
+        assert_eq!(p.media[0].kind, MediaKind::Video);
+        let quote = serde_json::json!({"code":"SC","media_type":19,"caption":{"text":"opinion"},"user":{"username":"quoter"},"text_post_app_info":{"share_info":{"quoted_post":inner}}});
+        let p = post(&data_media(quote), "SC").unwrap();
+        assert!(p.media.is_empty());
+        assert!(p.caption.unwrap().contains("Quoting @original"));
+    }
+
+    #[tokio::test]
+    #[ignore = "LIVE: public Threads network probe; no cookies or Telegram sends"]
+    async fn live_reported_share_and_reference_posts_use_production_chain() {
+        let mut cfg = crate::config::Config::test_default();
+        cfg.threads_user_agent = std::env::var("THREADS_USER_AGENT").unwrap_or_else(|_| "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36".into());
+        cfg.threads_sec_ch_ua = std::env::var("THREADS_SEC_CH_UA").unwrap_or_else(|_| {
+            r#""Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126""#.into()
+        });
+        let (http, share_http) = crate::threads_http::clients(None).unwrap();
+        let resolver = crate::threads_share::ThreadsShareResolver::with_client(
+            share_http,
+            cfg.threads_user_agent.clone(),
+            cfg.threads_sec_ch_ua.clone(),
+        );
+        let target = resolver
+            .resolve("https://www.threads.com/share/BBtSjKGHI4/")
+            .await
+            .unwrap();
+        assert_eq!(target.shortcode, "DemLs3Xk0VO");
+        let chain = super::super::build_threads_chain(&cfg, http);
+        for (url, code, author, kind) in [
+            (
+                target.canonical_url.as_str(),
+                target.shortcode.as_str(),
+                "meow.meow.journey",
+                MediaKind::Video,
+            ),
+            (
+                "https://www.threads.com/@dr.kyle_modern_tcm/post/Daxu9_bnYC9",
+                "Daxu9_bnYC9",
+                "dr.kyle_modern_tcm",
+                MediaKind::Video,
+            ),
+            (
+                "https://www.threads.com/@feel_pale/post/DdVO0fGCX-j",
+                "DdVO0fGCX-j",
+                "feel_pale",
+                MediaKind::Image,
+            ),
+        ] {
+            let p = chain.extract(url, code).await.unwrap();
+            assert_eq!(p.author.as_deref(), Some(author));
+            assert_eq!(p.media.len(), 1, "exactly the post attachment, no icon or poster");
+            assert_eq!(p.media[0].kind, kind);
+            assert!(p.media.iter().all(|m| !m.url.contains("/rsrc.php/")));
+            eprintln!(
+                "LIVE target={code} author={author} attachments={} first_kind={kind:?}",
+                p.media.len()
+            );
+        }
+    }
+
+    #[test]
+    fn own_and_linked_duplicate_url_remains_one_attachment() {
+        let node = serde_json::json!({"code":"SC","media_type":1,"image_versions2":{"candidates":[{"url":"https://scontent.cdninstagram.com/v/same.jpg"}]},"text_post_app_info":{"linked_inline_media":{"media_type":1,"image_versions2":{"candidates":[{"url":"https://scontent.cdninstagram.com/v/same.jpg"}]}}}});
+        assert_eq!(post(&data_media(node), "SC").unwrap().media.len(), 1);
     }
 
     #[test]
@@ -375,7 +742,11 @@ mod tests {
         assert_eq!(p.media.len(), 1, "video only, not its poster");
         assert_eq!(p.media[0].kind, MediaKind::Video);
         // Escaped slashes decoded; signed query string kept verbatim.
-        assert!(p.media[0].url.contains("clip.mp4?efg=abc&oe=DEAD"), "url={}", p.media[0].url);
+        assert!(
+            p.media[0].url.contains("clip.mp4?efg=abc&oe=DEAD"),
+            "url={}",
+            p.media[0].url
+        );
     }
 
     #[test]
@@ -434,7 +805,11 @@ mod tests {
                  "caption":{"text":"original post"},"user":{"username":"author"}}}}}}]}"#,
         );
         let p = post(&html, "SC").unwrap();
-        assert_eq!(p.author.as_deref(), Some("author"), "mirror the original author");
+        assert_eq!(
+            p.author.as_deref(),
+            Some("author"),
+            "mirror the original author"
+        );
         assert_eq!(p.caption.as_deref(), Some("original post"));
         assert_eq!(p.media.len(), 1);
         assert!(p.media[0].url.ends_with("orig.jpg"));
@@ -453,8 +828,14 @@ mod tests {
         assert_eq!(p.author.as_deref(), Some("quoter"));
         let cap = p.caption.unwrap();
         assert!(cap.contains("hot take"), "outer text kept: {cap}");
-        assert!(cap.contains("🔁 Quoting @author"), "inner attribution: {cap}");
-        assert!(cap.contains("https://www.threads.com/@author/post/INNER"), "inner link: {cap}");
+        assert!(
+            cap.contains("🔁 Quoting @author"),
+            "inner attribution: {cap}"
+        );
+        assert!(
+            cap.contains("https://www.threads.com/@author/post/INNER"),
+            "inner link: {cap}"
+        );
     }
 
     #[test]
@@ -478,9 +859,17 @@ mod tests {
         let p = post(&html, "SC").unwrap();
         assert_eq!(p.caption.as_deref(), Some("看世界盃這麼貴啊😂"));
         assert_eq!(p.author.as_deref(), Some("dr.kyle"));
-        assert_eq!(p.media.len(), 1, "linked IG video collected, not its poster");
+        assert_eq!(
+            p.media.len(),
+            1,
+            "linked IG video collected, not its poster"
+        );
         assert_eq!(p.media[0].kind, MediaKind::Video);
-        assert!(p.media[0].url.contains("clip.mp4?efg=abc&oe=AA"), "url={}", p.media[0].url);
+        assert!(
+            p.media[0].url.contains("clip.mp4?efg=abc&oe=AA"),
+            "url={}",
+            p.media[0].url
+        );
     }
 
     #[test]
@@ -527,14 +916,16 @@ mod tests {
               "image_versions2":{"candidates":[{"url":"https://evil.example/x.jpg"}]},
               "caption":{"text":"text"},"user":{"username":"u"}}}]}"#,
         );
-        let p = post(&html, "SC").unwrap();
-        assert!(p.media.is_empty(), "non-CDN media dropped");
-        assert_eq!(p.caption.as_deref(), Some("text"), "still delivered as text-only");
+        assert!(matches!(
+            parse_threads_post(&html, "SC", "u"),
+            ParseOutcome::Incomplete(_)
+        ));
     }
 
     #[test]
     fn empty_shell_is_classified_not_success() {
-        let html = "<html><body><script type=\"application/json\">{\"config\":{}}</script></body></html>";
+        let html =
+            "<html><body><script type=\"application/json\">{\"config\":{}}</script></body></html>";
         assert!(matches!(
             parse_threads_post(html, "SC", "u"),
             ParseOutcome::EmptyShell
@@ -542,38 +933,61 @@ mod tests {
     }
 
     #[test]
-    fn data_present_but_post_missing_is_notfound() {
-        let html = script(r#"{"thread_items":[{"post":{"code":"OTHER","caption":{"text":"x"},"user":{"username":"u"}}}]}"#);
+    fn unrelated_data_is_not_proof_of_deletion() {
+        let html = script(
+            r#"{"thread_items":[{"post":{"code":"OTHER","caption":{"text":"x"},"user":{"username":"u"}}}]}"#,
+        );
         assert!(matches!(
             parse_threads_post(&html, "SC", "u"),
-            ParseOutcome::NotFound
+            ParseOutcome::EmptyShell
         ));
     }
 
     #[test]
     fn captured_audience_route_is_restricted_without_visible_html() {
         // Reduced public payload from the reported BARWV10v9i share's target.
-        let html = script(r#"{"require":[{"initialRouteInfo":{"route":{
+        let html = script(
+            r#"{"require":[{"initialRouteInfo":{"route":{
             "rootView":{"resource":{"__dr":"BarcelonaGeoBlockedErrorRoot.react"},
             "props":{"title":"This content isn't available to everyone","description":"It can't be seen by certain audiences."}},
-            "tracePolicy":"barcelona.geoBlockPage"}}}]}"#);
-        assert!(matches!(parse_threads_post(&html, "SC", "u"), ParseOutcome::LoginWalled));
-        let unused = script(r#"{"resources":["BarcelonaGeoBlockedErrorRoot.react"],"strings":["This content isn't available to everyone"]}"#);
-        assert!(matches!(parse_threads_post(&unused, "SC", "u"), ParseOutcome::EmptyShell));
+            "tracePolicy":"barcelona.geoBlockPage"}}}]}"#,
+        );
+        assert!(matches!(
+            parse_threads_post(&html, "SC", "u"),
+            ParseOutcome::LoginWalled
+        ));
+        let unused = script(
+            r#"{"resources":["BarcelonaGeoBlockedErrorRoot.react"],"strings":["This content isn't available to everyone"]}"#,
+        );
+        assert!(matches!(
+            parse_threads_post(&unused, "SC", "u"),
+            ParseOutcome::EmptyShell
+        ));
     }
 
     #[test]
     fn audience_wall_uses_visible_text_only() {
         let wall = "<h1>This content isn't available to everyone</h1><p>It can't be seen by certain audiences. See Why</p>";
-        assert!(matches!(parse_threads_post(wall, "SC", "u"), ParseOutcome::LoginWalled));
-        let script_only = format!("<script>{wall}</script><template>{wall}</template><div hidden>{wall}</div>");
-        assert!(matches!(parse_threads_post(&script_only, "SC", "u"), ParseOutcome::EmptyShell));
-        assert!(!looks_login_walled("<p>Sorry, this page isn't available</p>"));
+        assert!(matches!(
+            parse_threads_post(wall, "SC", "u"),
+            ParseOutcome::LoginWalled
+        ));
+        let script_only =
+            format!("<script>{wall}</script><template>{wall}</template><div hidden>{wall}</div>");
+        assert!(matches!(
+            parse_threads_post(&script_only, "SC", "u"),
+            ParseOutcome::EmptyShell
+        ));
+        assert!(!looks_login_walled(
+            "<p>Sorry, this page isn't available</p>"
+        ));
     }
 
     #[test]
     fn available_post_takes_precedence_over_wall_phrases() {
-        let html = script(r#"{"thread_items":[{"post":{"code":"SC","caption":{"text":"log in to see is just a phrase"},"user":{"username":"u"}}}]}"#);
+        let html = script(
+            r#"{"thread_items":[{"post":{"code":"SC","caption":{"text":"log in to see is just a phrase"},"user":{"username":"u"}}}]}"#,
+        );
         let html = format!("{html}<p>Log in to see more posts</p>");
         assert!(post(&html, "SC").is_some());
     }

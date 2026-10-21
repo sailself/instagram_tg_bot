@@ -59,7 +59,9 @@ teloxide long-poll dispatcher
 Backends implement the pluggable `Extractor` trait (`src/extract/mod.rs`) — it
 takes the canonical post `url` + shortcode and returns a `Post`, so it serves
 both platforms (route by **host**, not shortcode). The IG embed scraper and the
-Threads JSON scraper share the Polaris media-collection (`collect_meta_media`).
+Threads JSON scraper share the Polaris media collection. Threads checks both
+modern `data.media` and legacy `thread_items` JSON envelopes by exact shortcode,
+then collects own and inline-linked Instagram media.
 yt-dlp/gallery-dl do **not** support Threads, so the Threads chain is in-process
 only (`threads_json` primary, `threads_embed` the `/embed`-HTML fallback).
 
@@ -92,14 +94,28 @@ only (`threads_json` primary, `threads_embed` the `/embed`-HTML fallback).
   SSRF/exfil vector). It allowlists `*.cdninstagram.com` / `*.fbcdn.net`, which
   serve **both** Instagram and Threads media — there is no per-platform CDN list.
 - **Text-only posts are valid output** (Threads is text-first). The Threads chain
-  is built `accept_textonly`, so a caption-only `Post` is success and `sender.rs`
-  delivers it as text; never classify "no media but has caption" as a failure for
-  Threads. The IG chain keeps media required.
+  is built `accept_textonly`, so a genuinely media-less `Post` is success and
+  `sender.rs` delivers it as text. Known missing attachments are different:
+  `IncompleteMedia` carries total/image/video requirements through fallback;
+  text, a poster, or a partial album cannot mask that failure. A later complete
+  result may recover it. The IG chain keeps media required.
 - **Threads header gate**: the post JSON is served logged-out **only** to a
   *coherent desktop-browser* header set (`THREADS_USER_AGENT` /
   `THREADS_SEC_CH_UA`, hot-config). A naive/crawler UA returns HTTP 200 + an
-  **empty shell** (0 `thread_items`) — classify that as a failure, **never**
-  silent success.
+  **empty shell** (no recognized target post) — classify that as a failure,
+  **never** silent success. A missing target in parser data is not proof of
+  deletion; related recommendations may be the only `thread_items` present.
+- **Threads embed media must be post attachments.** Use semantic attachment
+  containers and preserve DOM order; exclude avatars, link-card icons/previews,
+  and nested quote/recommendation media. Extract usernames from profile links,
+  not concatenated header text. Known unresolved Instagram cards must not
+  become successful text-only output. No automatic cross-platform fetch is
+  added by recognizing an attachment URL.
+- **Video renditions and incomplete carousels:** try valid rendition candidates
+  in source order. A known video with no playable URL must never become its
+  poster. Track missing carousel slots for Threads so partial media cannot be
+  reported as a complete extraction; failures retain a link and release owned
+  dedup claims through the existing failure path.
 - **Cookieless-first.** Do NOT enable Instagram/Threads login/cookies or the
   external fallback by default — config-gated (`IG_COOKIES_PATH`,
   `THREADS_COOKIES_PATH`, `FALLBACK_PROVIDER`). Any cookie use is a disposable burner, never a real

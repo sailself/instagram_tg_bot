@@ -35,10 +35,18 @@ pub struct Media {
 
 impl Media {
     pub fn image(url: impl Into<String>) -> Self {
-        Self { kind: MediaKind::Image, url: url.into(), local_path: None }
+        Self {
+            kind: MediaKind::Image,
+            url: url.into(),
+            local_path: None,
+        }
     }
     pub fn video(url: impl Into<String>) -> Self {
-        Self { kind: MediaKind::Video, url: url.into(), local_path: None }
+        Self {
+            kind: MediaKind::Video,
+            url: url.into(),
+            local_path: None,
+        }
     }
 }
 
@@ -51,6 +59,36 @@ pub struct Post {
     pub original_url: String,
 }
 
+/// Minimum attachment counts observed in an earlier extraction attempt.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MediaRequirements {
+    pub total: usize,
+    pub images: usize,
+    pub videos: usize,
+}
+
+impl MediaRequirements {
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.total = self.total.max(other.total);
+        self.images = self.images.max(other.images);
+        self.videos = self.videos.max(other.videos);
+        self.total = self.total.max(self.images.saturating_add(self.videos));
+    }
+
+    pub(crate) fn is_satisfied_by(&self, media: &[Media]) -> bool {
+        media.len() >= self.total
+            && media.iter().filter(|m| m.kind == MediaKind::Image).count() >= self.images
+            && media.iter().filter(|m| m.kind == MediaKind::Video).count() >= self.videos
+    }
+}
+
+/// Strict collection keeps evidence of omitted attachments beside usable media.
+pub(crate) struct MetaMediaCollection {
+    pub media: Vec<Media>,
+    pub required: MediaRequirements,
+    pub incomplete: bool,
+}
+
 #[derive(Debug, Error)]
 pub enum ExtractError {
     #[error("post not found / removed")]
@@ -61,6 +99,8 @@ pub enum ExtractError {
     Restricted,
     #[error("HTTP 429 rate limit")]
     RateLimited,
+    #[error("known attachments could not be extracted: {0:?}")]
+    IncompleteMedia(MediaRequirements),
     #[error("backend unavailable: {0}")]
     Unavailable(String),
     #[error("parse/transient error: {0}")]
@@ -89,13 +129,19 @@ pub struct ExtractorChain {
 
 impl ExtractorChain {
     pub fn new(backends: Vec<Box<dyn Extractor>>) -> Self {
-        Self { backends, accept_textonly: false }
+        Self {
+            backends,
+            accept_textonly: false,
+        }
     }
 
     /// Like [`new`](Self::new) but a caption-only [`Post`] (no media) counts as
     /// success — for text-first platforms like Threads.
     pub fn new_accepting_textonly(backends: Vec<Box<dyn Extractor>>) -> Self {
-        Self { backends, accept_textonly: true }
+        Self {
+            backends,
+            accept_textonly: true,
+        }
     }
 
     pub fn names(&self) -> Vec<&'static str> {
@@ -105,25 +151,50 @@ impl ExtractorChain {
     pub async fn extract(&self, url: &str, shortcode: &str) -> Result<Post, ExtractError> {
         // `shortcode` rides on the surrounding job span, so it's omitted here.
         let mut last = ExtractError::Unavailable("no backends configured".into());
+        let mut required = MediaRequirements::default();
         for b in &self.backends {
             let started = std::time::Instant::now();
             let result = b.extract(url, shortcode).await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
+            let result = match result {
+                Err(ExtractError::IncompleteMedia(missing)) => {
+                    required.merge(missing);
+                    Err(ExtractError::IncompleteMedia(required))
+                }
+                Ok(post) if !required.is_satisfied_by(&post.media) => {
+                    Err(ExtractError::IncompleteMedia(required))
+                }
+                other => other,
+            };
             match result {
                 // Success requires media — "text but no media" is a failure for
                 // the media role (PLAN §4.8) …
                 Ok(p) if !p.media.is_empty() => {
-                    tracing::info!(backend = b.name(), media = p.media.len(), elapsed_ms, "extracted");
+                    tracing::info!(
+                        backend = b.name(),
+                        media = p.media.len(),
+                        elapsed_ms,
+                        "extracted"
+                    );
                     return Ok(p);
                 }
                 // … unless this is a text-first chain (Threads): a caption-only
                 // post is a valid result, delivered as text (Threads design).
                 Ok(p) if self.accept_textonly && has_text(&p) => {
-                    tracing::info!(backend = b.name(), media = 0, elapsed_ms, "extracted text-only post");
+                    tracing::info!(
+                        backend = b.name(),
+                        media = 0,
+                        elapsed_ms,
+                        "extracted text-only post"
+                    );
                     return Ok(p);
                 }
                 Ok(_) => {
-                    tracing::warn!(backend = b.name(), elapsed_ms, "no media, trying next backend");
+                    tracing::warn!(
+                        backend = b.name(),
+                        elapsed_ms,
+                        "no media, trying next backend"
+                    );
                     keep_worst(&mut last, ExtractError::NotFound);
                 }
                 Err(e) => {
@@ -180,7 +251,10 @@ pub(crate) fn media_by_ext(url: &str) -> Media {
 /// De-duplicate media by URL, preserving order.
 pub(crate) fn dedup_media(media: Vec<Media>) -> Vec<Media> {
     let mut seen = std::collections::HashSet::new();
-    media.into_iter().filter(|m| seen.insert(m.url.clone())).collect()
+    media
+        .into_iter()
+        .filter(|m| seen.insert(m.url.clone()))
+        .collect()
 }
 
 /// Collect media from a Meta/Instagram-family post node — the Polaris /
@@ -189,38 +263,78 @@ pub(crate) fn dedup_media(media: Vec<Media>) -> Vec<Media> {
 /// normalized (entity/unicode-decoded, query string left verbatim) and
 /// host-gated. Shared by the IG embed scraper and the Threads scraper.
 pub(crate) fn collect_meta_media(node: &Value) -> Vec<Media> {
-    let mut out = Vec::new();
-    if let Some(children) = node.pointer("/carousel_media").and_then(Value::as_array) {
-        for child in children {
-            push_meta_single(child, &mut out);
-        }
-    } else {
-        push_meta_single(node, &mut out);
-    }
-    out
+    collect_meta_media_strict(node).media
 }
 
-/// Push one image or video from a (child) node. Prefers the playable video — a
-/// video node also carries an `image_versions2` poster we must not send as a
-/// still (Telegram would reject a still sent via `send_video`).
-fn push_meta_single(node: &Value, out: &mut Vec<Media>) {
-    if let Some(u) = node
-        .pointer("/video_versions/0/url")
-        .and_then(Value::as_str)
-        .map(normalize_cdn_url)
-        .filter(|u| is_meta_cdn(u))
-    {
-        out.push(Media::video(u));
+pub(crate) fn collect_meta_media_strict(node: &Value) -> MetaMediaCollection {
+    let mut media = Vec::new();
+    let mut required = MediaRequirements::default();
+    collect_meta_node(node, &mut media, &mut required);
+    let incomplete = !required.is_satisfied_by(&media);
+    MetaMediaCollection {
+        media,
+        required,
+        incomplete,
+    }
+}
+
+fn collect_meta_node(node: &Value, out: &mut Vec<Media>, required: &mut MediaRequirements) {
+    let kind = node.get("media_type").and_then(Value::as_u64);
+    let declared = node
+        .get("carousel_media_count")
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0);
+    if let Some(children) = node.get("carousel_media").and_then(Value::as_array) {
+        let before = required.total;
+        for child in children {
+            collect_meta_node(child, out, required);
+        }
+        // Each carousel slot represents an attachment, even if its payload is empty.
+        required.total = required
+            .total
+            .max(before.saturating_add(children.len().max(declared)));
+        if children.is_empty() && kind == Some(8) {
+            required.total = required.total.max(before.saturating_add(1));
+        }
         return;
     }
-    if let Some(u) = node
-        .pointer("/image_versions2/candidates/0/url")
-        .and_then(Value::as_str)
-        .map(normalize_cdn_url)
-        .filter(|u| is_meta_cdn(u))
-    {
-        out.push(Media::image(u));
+    if kind == Some(8) || declared > 0 {
+        // A carousel thumbnail is not a substitute for absent child records.
+        required.total = required.total.saturating_add(declared.max(1));
+        return;
     }
+    let videos = node.get("video_versions").and_then(Value::as_array);
+    let is_video = kind == Some(2) || videos.is_some_and(|v| !v.is_empty());
+    if is_video {
+        required.total += 1;
+        required.videos += 1;
+        if let Some(url) = first_meta_rendition(videos) {
+            out.push(Media::video(url));
+        }
+        // A video poster never establishes recovery of a missing video.
+        return;
+    }
+    let images = node
+        .pointer("/image_versions2/candidates")
+        .and_then(Value::as_array);
+    if kind == Some(1) || images.is_some_and(|v| !v.is_empty()) {
+        required.total += 1;
+        required.images += 1;
+        if let Some(url) = first_meta_rendition(images) {
+            out.push(Media::image(url));
+        }
+    } else if !node.is_object() || node.as_object().is_some_and(|n| n.is_empty()) {
+        required.total += 1;
+    }
+}
+
+fn first_meta_rendition(candidates: Option<&Vec<Value>>) -> Option<String> {
+    candidates?
+        .iter()
+        .filter_map(|v| v.get("url").and_then(Value::as_str))
+        .map(normalize_cdn_url)
+        .find(|u| is_meta_cdn(u))
 }
 
 /// Decode the encodings IG applies to media URLs, so the signature stays intact
@@ -292,7 +406,9 @@ pub fn report_backend_binaries(cfg: &Config) {
     }
     if cfg.ig_cookies_path.is_some() {
         match probe_binary(&cfg.gallery_dl_path) {
-            Ok(v) => tracing::info!(binary = %cfg.gallery_dl_path, version = %v, "gallery-dl found"),
+            Ok(v) => {
+                tracing::info!(binary = %cfg.gallery_dl_path, version = %v, "gallery-dl found")
+            }
             Err(e) => tracing::warn!(
                 binary = %cfg.gallery_dl_path,
                 error = %e,
@@ -306,9 +422,10 @@ pub fn report_backend_binaries(cfg: &Config) {
 /// instead of letting a later empty-media `NotFound` mask an earlier `Blocked`.
 fn severity(e: &ExtractError) -> u8 {
     match e {
-        ExtractError::Restricted => 5,
-        ExtractError::RateLimited => 4,
-        ExtractError::Blocked => 3,
+        ExtractError::Restricted => 6,
+        ExtractError::RateLimited => 5,
+        ExtractError::Blocked => 4,
+        ExtractError::IncompleteMedia(_) => 3,
         ExtractError::Transient(_) => 2,
         ExtractError::NotFound => 1,
         ExtractError::Unavailable(_) => 0,
@@ -318,6 +435,12 @@ fn severity(e: &ExtractError) -> u8 {
 /// Replace `slot` with `candidate` only if it is strictly more severe, so the
 /// first most-actionable error seen across backends wins.
 fn keep_worst(slot: &mut ExtractError, candidate: ExtractError) {
+    if let (ExtractError::IncompleteMedia(current), ExtractError::IncompleteMedia(next)) =
+        (&mut *slot, &candidate)
+    {
+        current.merge(*next);
+        return;
+    }
     if severity(&candidate) > severity(slot) {
         *slot = candidate;
     }
@@ -336,8 +459,14 @@ fn has_text(p: &Post) -> bool {
 /// (+ external fallback if configured). Media required.
 pub fn build_ig_chain(cfg: &Config, http: reqwest::Client) -> ExtractorChain {
     let mut backends: Vec<Box<dyn Extractor>> = vec![
-        Box::new(embed::EmbedScraper::new(http.clone(), cfg.embed_user_agent.clone())),
-        Box::new(yt_dlp::YtDlpExtractor::new(cfg.yt_dlp_path.clone(), cfg.ig_cookies_path.clone())),
+        Box::new(embed::EmbedScraper::new(
+            http.clone(),
+            cfg.embed_user_agent.clone(),
+        )),
+        Box::new(yt_dlp::YtDlpExtractor::new(
+            cfg.yt_dlp_path.clone(),
+            cfg.ig_cookies_path.clone(),
+        )),
     ];
 
     if let Some(cookies) = &cfg.ig_cookies_path {
@@ -415,8 +544,12 @@ mod tests {
     #[test]
     fn is_meta_cdn_requires_real_host() {
         assert!(is_meta_cdn("https://scontent.cdninstagram.com/v/a.jpg?x=1"));
-        assert!(is_meta_cdn("https://instagram.fabc1-2.fna.fbcdn.net/v/b.mp4"));
-        assert!(!is_meta_cdn("https://attacker.example/p?ref=cdninstagram.com"));
+        assert!(is_meta_cdn(
+            "https://instagram.fabc1-2.fna.fbcdn.net/v/b.mp4"
+        ));
+        assert!(!is_meta_cdn(
+            "https://attacker.example/p?ref=cdninstagram.com"
+        ));
         assert!(!is_meta_cdn("https://cdninstagram.com.evil.test/x"));
         assert!(!is_meta_cdn("ftp://scontent.cdninstagram.com/x"));
         assert!(!is_meta_cdn("not a url"));
@@ -424,13 +557,22 @@ mod tests {
 
     #[test]
     fn media_by_ext_only_real_video_exts() {
-        assert_eq!(media_by_ext("https://x.cdninstagram.com/v/a.mp4?q=1").kind, MediaKind::Video);
-        assert_eq!(media_by_ext("https://x.cdninstagram.com/o1/v/a.jpg").kind, MediaKind::Image);
-        assert_eq!(media_by_ext("https://x.cdninstagram.com/v/a.webp").kind, MediaKind::Image);
+        assert_eq!(
+            media_by_ext("https://x.cdninstagram.com/v/a.mp4?q=1").kind,
+            MediaKind::Video
+        );
+        assert_eq!(
+            media_by_ext("https://x.cdninstagram.com/o1/v/a.jpg").kind,
+            MediaKind::Image
+        );
+        assert_eq!(
+            media_by_ext("https://x.cdninstagram.com/v/a.webp").kind,
+            MediaKind::Image
+        );
     }
 
     /// Mock backend: `Ok(n)` yields a Post with `n` media items; `Err(e)` fails.
-    struct Mock(Result<usize, ExtractError>);
+    pub(super) struct Mock(pub(super) Result<usize, ExtractError>);
     #[async_trait]
     impl Extractor for Mock {
         fn name(&self) -> &'static str {
@@ -458,6 +600,7 @@ mod tests {
             ExtractError::RateLimited => ExtractError::RateLimited,
             ExtractError::Unavailable(s) => ExtractError::Unavailable(s.clone()),
             ExtractError::Transient(s) => ExtractError::Transient(s.clone()),
+            ExtractError::IncompleteMedia(r) => ExtractError::IncompleteMedia(*r),
         }
     }
 
@@ -467,7 +610,10 @@ mod tests {
             Box::new(Mock(Err(ExtractError::Restricted))),
             Box::new(Mock(Err(ExtractError::Unavailable("empty embed".into())))),
         ]);
-        assert!(matches!(c.extract("u", "s").await, Err(ExtractError::Restricted)));
+        assert!(matches!(
+            c.extract("u", "s").await,
+            Err(ExtractError::Restricted)
+        ));
         assert!(matches!(threads_status(429), ExtractError::RateLimited));
         assert!(matches!(threads_status(403), ExtractError::Blocked));
         assert!(matches!(threads_status(503), ExtractError::Transient(_)));
@@ -482,14 +628,29 @@ mod tests {
     #[tokio::test]
     async fn chain_keeps_most_severe_error() {
         // Blocked then empty-media must surface Blocked, not NotFound.
-        let c = ExtractorChain::new(vec![Box::new(Mock(Err(ExtractError::Blocked))), Box::new(Mock(Ok(0)))]);
-        assert!(matches!(c.extract("u", "s").await, Err(ExtractError::Blocked)));
+        let c = ExtractorChain::new(vec![
+            Box::new(Mock(Err(ExtractError::Blocked))),
+            Box::new(Mock(Ok(0))),
+        ]);
+        assert!(matches!(
+            c.extract("u", "s").await,
+            Err(ExtractError::Blocked)
+        ));
         // empty-media then Blocked also surfaces Blocked.
-        let c = ExtractorChain::new(vec![Box::new(Mock(Ok(0))), Box::new(Mock(Err(ExtractError::Blocked)))]);
-        assert!(matches!(c.extract("u", "s").await, Err(ExtractError::Blocked)));
+        let c = ExtractorChain::new(vec![
+            Box::new(Mock(Ok(0))),
+            Box::new(Mock(Err(ExtractError::Blocked))),
+        ]);
+        assert!(matches!(
+            c.extract("u", "s").await,
+            Err(ExtractError::Blocked)
+        ));
         // only empty-media → NotFound.
         let c = ExtractorChain::new(vec![Box::new(Mock(Ok(0)))]);
-        assert!(matches!(c.extract("u", "s").await, Err(ExtractError::NotFound)));
+        assert!(matches!(
+            c.extract("u", "s").await,
+            Err(ExtractError::NotFound)
+        ));
     }
 
     /// Backend that returns a caption-only Post (no media) — a Threads text post.
@@ -513,7 +674,10 @@ mod tests {
     async fn textonly_chain_accepts_caption_only_post() {
         // A media-required (Instagram) chain rejects a media-less post …
         let c = ExtractorChain::new(vec![Box::new(TextOnly(Some("just text")))]);
-        assert!(matches!(c.extract("u", "s").await, Err(ExtractError::NotFound)));
+        assert!(matches!(
+            c.extract("u", "s").await,
+            Err(ExtractError::NotFound)
+        ));
         // … but a text-accepting (Threads) chain delivers it as text.
         let c = ExtractorChain::new_accepting_textonly(vec![Box::new(TextOnly(Some("just text")))]);
         let post = c.extract("u", "s").await.unwrap();
@@ -526,9 +690,15 @@ mod tests {
         // No media AND a blank/absent caption is still a failure, even for a
         // text-accepting chain (don't reply with an empty message).
         let c = ExtractorChain::new_accepting_textonly(vec![Box::new(TextOnly(Some("   ")))]);
-        assert!(matches!(c.extract("u", "s").await, Err(ExtractError::NotFound)));
+        assert!(matches!(
+            c.extract("u", "s").await,
+            Err(ExtractError::NotFound)
+        ));
         let c = ExtractorChain::new_accepting_textonly(vec![Box::new(TextOnly(None))]);
-        assert!(matches!(c.extract("u", "s").await, Err(ExtractError::NotFound)));
+        assert!(matches!(
+            c.extract("u", "s").await,
+            Err(ExtractError::NotFound)
+        ));
     }
 }
 
@@ -548,12 +718,176 @@ mod story_chain_tests {
     #[test]
     fn story_chain_requires_cookies_and_never_uses_the_embed_scraper() {
         let mut cfg = Config::test_default();
-        assert!(build_ig_story_chain(&cfg).is_none(), "cookieless -> no story chain");
+        assert!(
+            build_ig_story_chain(&cfg).is_none(),
+            "cookieless -> no story chain"
+        );
         cfg.ig_cookies_path = Some("/etc/igbot/cookies.txt".into());
         let chain = build_ig_story_chain(&cfg).expect("cookies -> story chain");
         // gallery-dl first (it handles image stories; yt-dlp only yields video
         // items), then yt-dlp. The embed scraper is excluded: a logged-out
         // story page's og:image is the profile picture, not the story.
         assert_eq!(chain.names(), vec!["gallery-dl", "yt-dlp"]);
+    }
+}
+
+#[cfg(test)]
+mod completeness_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn rendition_selection_preserves_signature_and_skips_invalid_first() {
+        let node = json!({"media_type": 2, "video_versions": [
+            {"url":"https://evil.test/video.mp4"},
+            {"url":"https://x.cdninstagram.com/v.mp4?z=2&amp;a=1\\u0026sig=x%2Fy"}
+        ], "image_versions2":{"candidates":[{"url":"https://x.cdninstagram.com/poster.jpg"}]}});
+        let found = collect_meta_media_strict(&node);
+        assert!(!found.incomplete);
+        assert_eq!(found.media.len(), 1);
+        assert_eq!(found.media[0].kind, MediaKind::Video);
+        assert_eq!(
+            found.media[0].url,
+            "https://x.cdninstagram.com/v.mp4?z=2&a=1&sig=x%2Fy"
+        );
+        let image = json!({"media_type":1,"image_versions2":{"candidates":[
+            {"url":"bad"},{"url":"https://x.fbcdn.net/image.jpg?b=2&a=1"}]}});
+        assert_eq!(
+            collect_meta_media(&image)[0].url,
+            "https://x.fbcdn.net/image.jpg?b=2&a=1"
+        );
+    }
+
+    #[test]
+    fn missing_video_is_never_replaced_with_poster() {
+        let found = collect_meta_media_strict(&json!({"media_type":2,
+            "video_versions":[{"url":"https://evil.test/v.mp4"}],
+            "image_versions2":{"candidates":[{"url":"https://x.fbcdn.net/poster.jpg"}]}}));
+        assert!(found.incomplete);
+        assert!(found.media.is_empty());
+        assert_eq!(
+            found.required,
+            MediaRequirements {
+                total: 1,
+                videos: 1,
+                images: 0
+            }
+        );
+    }
+
+    #[test]
+    fn carousel_counts_missing_slots_and_keeps_survivors_in_order() {
+        let found = collect_meta_media_strict(&json!({"media_type":8,"carousel_media_count":4,
+        "carousel_media":[
+            {"media_type":1,"image_versions2":{"candidates":[{"url":"https://x.fbcdn.net/one.jpg"}]}},
+            {"media_type":2,"video_versions":[]},
+            {}
+        ]}));
+        assert!(found.incomplete);
+        assert_eq!(found.media.len(), 1);
+        assert_eq!(
+            found.required,
+            MediaRequirements {
+                total: 4,
+                images: 1,
+                videos: 1
+            }
+        );
+        let text = collect_meta_media_strict(&json!({"media_type":19,"caption":{"text":"hello"}}));
+        assert!(!text.incomplete);
+        assert_eq!(text.required, MediaRequirements::default());
+    }
+
+    #[test]
+    fn absent_carousel_children_do_not_become_a_thumbnail() {
+        for children in [Value::Null, json!("unrecognized")] {
+            let found = collect_meta_media_strict(&json!({
+                "media_type":8,"carousel_media_count":3,"carousel_media":children,
+                "image_versions2":{"candidates":[{"url":"https://x.fbcdn.net/thumbnail.jpg"}]}
+            }));
+            assert!(found.incomplete);
+            assert!(found.media.is_empty());
+            assert_eq!(found.required.total, 3);
+        }
+    }
+
+    struct ResultBackend(Result<Vec<Media>, MediaRequirements>);
+    #[async_trait]
+    impl Extractor for ResultBackend {
+        fn name(&self) -> &'static str {
+            "completeness-test"
+        }
+        async fn extract(&self, _: &str, _: &str) -> Result<Post, ExtractError> {
+            match &self.0 {
+                Ok(media) => Ok(Post {
+                    author: None,
+                    caption: Some("caption".into()),
+                    media: media.clone(),
+                    original_url: "u".into(),
+                }),
+                Err(required) => Err(ExtractError::IncompleteMedia(*required)),
+            }
+        }
+    }
+    fn missing(total: usize, images: usize, videos: usize) -> Box<dyn Extractor> {
+        Box::new(ResultBackend(Err(MediaRequirements {
+            total,
+            images,
+            videos,
+        })))
+    }
+    fn recovered(media: Vec<Media>) -> Box<dyn Extractor> {
+        Box::new(ResultBackend(Ok(media)))
+    }
+
+    #[tokio::test]
+    async fn incomplete_chain_rejects_text_partial_and_wrong_kind_but_recovers() {
+        let cases = [
+            vec![],
+            vec![Media::image("i")],
+            vec![Media::image("i"), Media::image("j")],
+        ];
+        for media in cases {
+            let chain =
+                ExtractorChain::new_accepting_textonly(vec![missing(2, 1, 1), recovered(media)]);
+            assert!(matches!(
+                chain.extract("u", "s").await,
+                Err(ExtractError::IncompleteMedia(_))
+            ));
+        }
+        let chain = ExtractorChain::new_accepting_textonly(vec![
+            missing(2, 1, 1),
+            recovered(vec![]),
+            recovered(vec![Media::image("i"), Media::video("v")]),
+        ]);
+        assert_eq!(chain.extract("u", "s").await.unwrap().media.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn incomplete_chain_accumulates_requirements_and_preserves_restriction_priority() {
+        let chain = ExtractorChain::new_accepting_textonly(vec![
+            missing(1, 0, 1),
+            missing(3, 2, 0),
+            recovered(vec![]),
+        ]);
+        match chain.extract("u", "s").await {
+            Err(ExtractError::IncompleteMedia(r)) => assert_eq!(
+                r,
+                MediaRequirements {
+                    total: 3,
+                    images: 2,
+                    videos: 1
+                }
+            ),
+            other => panic!("expected incomplete, got {other:?}"),
+        }
+        let chain = ExtractorChain::new_accepting_textonly(vec![
+            missing(1, 0, 1),
+            Box::new(super::tests::Mock(Err(ExtractError::Restricted))),
+        ]);
+        assert!(matches!(
+            chain.extract("u", "s").await,
+            Err(ExtractError::Restricted)
+        ));
     }
 }

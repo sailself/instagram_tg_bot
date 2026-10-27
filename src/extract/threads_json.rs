@@ -10,7 +10,9 @@
 //! `user.username`), so media collection is shared via [`collect_meta_media_strict`].
 //! An Instagram post shared inline to Threads rides along as a full Polaris
 //! node under `text_post_app_info/linked_inline_media` (observed live); its
-//! media is appended after the post's own via [`collect_threads_media`].
+//! media is appended after the post's own via [`collect_threads_media`]. So is
+//! media reused from another Threads post ("Use media"), whose source post
+//! rides under `share_info.quoted_attachment_post` (observed live 2026-10).
 //!
 //! NB: the exact nesting for quote/repost (`text_post_app_info.share_info.*`) is
 //! best-effort and flagged for live validation; it degrades to the outer post.
@@ -232,7 +234,10 @@ fn find_thread_posts<'a>(v: &'a Value, shortcode: &str, out: &mut Vec<&'a Value>
             for (key, child) in map {
                 if !matches!(
                     key.as_str(),
-                    "quoted_post" | "reposted_post" | "linked_inline_media"
+                    "quoted_post"
+                        | "reposted_post"
+                        | "linked_inline_media"
+                        | "quoted_attachment_post"
                 ) {
                     find_thread_posts(child, shortcode, out);
                 }
@@ -250,7 +255,8 @@ fn find_thread_posts<'a>(v: &'a Value, shortcode: &str, out: &mut Vec<&'a Value>
 /// Media of a Threads post node: its own media plus any Instagram post shared
 /// inline (`text_post_app_info/linked_inline_media` — a full Polaris media
 /// node riding along; observed live on share-to-Threads posts, where
-/// `share_info.quoted_post`/`reposted_post` stay null). Own media first.
+/// `share_info.quoted_post`/`reposted_post` stay null), then any media reused
+/// from another Threads post ([`reused_media`]). Own media first.
 fn collect_threads_media(node: &Value) -> MetaMediaCollection {
     let mut media = collect_meta_media_strict(node);
     let mut linked = node
@@ -276,10 +282,10 @@ fn collect_threads_media(node: &Value) -> MetaMediaCollection {
         linked.required.merge(card);
     }
     if let Some(linked) = linked {
-        media.media.extend(linked.media);
-        media.required.total += linked.required.total;
-        media.required.images += linked.required.images;
-        media.required.videos += linked.required.videos;
+        append_attachment(&mut media, linked);
+    }
+    if let Some(reused) = reused_media(node) {
+        append_attachment(&mut media, reused);
     }
     // URL dedup applies to evidence as well as delivery. Preserve only the
     // unresolved deficit in addition to distinct usable attachments.
@@ -313,6 +319,46 @@ fn collect_threads_media(node: &Value) -> MetaMediaCollection {
     media
 }
 
+/// Attachments are separate slots, so their requirements add up (unlike
+/// [`MediaRequirements::merge`], which reconciles two views of one post).
+fn append_attachment(into: &mut MetaMediaCollection, extra: MetaMediaCollection) {
+    into.media.extend(extra.media);
+    into.required.total += extra.required.total;
+    into.required.images += extra.required.images;
+    into.required.videos += extra.required.videos;
+}
+
+/// Media reused from another Threads post ("Use media"): the source post rides
+/// along as a full Polaris node under `share_info.quoted_attachment_post`.
+/// When the viewer can't see the source, that node is null and
+/// `quoted_attachment_post_unavailable` is set — still a known attachment, so
+/// it counts as one unresolved slot of unknown kind, never as a text-only post.
+fn reused_media(node: &Value) -> Option<MetaMediaCollection> {
+    if let Some(source) = reused_source(node) {
+        let mut reused = collect_meta_media_strict(source);
+        // A reused source always carries media, even if this projection omits it.
+        reused.required.total = reused.required.total.max(1);
+        return Some(reused);
+    }
+    let unavailable = node
+        .pointer("/text_post_app_info/share_info/quoted_attachment_post_unavailable")
+        .and_then(Value::as_bool)
+        == Some(true);
+    unavailable.then(|| MetaMediaCollection {
+        media: Vec::new(),
+        required: MediaRequirements {
+            total: 1,
+            ..MediaRequirements::default()
+        },
+        incomplete: true,
+    })
+}
+
+fn reused_source(node: &Value) -> Option<&Value> {
+    node.pointer("/text_post_app_info/share_info/quoted_attachment_post")
+        .filter(|n| n.is_object())
+}
+
 /// Build a [`Post`] from a matched node, resolving reposts/quotes (Threads
 /// design: a pure repost → mirror the original; a quote-post → outer content +
 /// a link/attribution to the inner post).
@@ -327,14 +373,10 @@ fn build_post(node: &Value, original_url: &str) -> Result<Option<Post>, MediaReq
     let has_own = !media.is_empty() || caption.as_deref().is_some_and(|c| !c.trim().is_empty());
 
     if has_own {
+        caption = with_note(caption, reuse_note(node));
         // Quote-post: outer has its own content AND embeds another post — append
         // an attribution line to the inner post (don't fetch its media).
-        if let Some(note) = inner_post(node).and_then(quote_note) {
-            caption = Some(match caption {
-                Some(c) if !c.trim().is_empty() => format!("{c}\n\n{note}"),
-                _ => note,
-            });
-        }
+        caption = with_note(caption, inner_post(node).and_then(quote_note));
         return Ok(Some(Post {
             author,
             caption,
@@ -358,7 +400,7 @@ fn build_post(node: &Value, original_url: &str) -> Result<Option<Post>, MediaReq
         {
             return Ok(Some(Post {
                 author: author_of(inner),
-                caption: inner_caption,
+                caption: with_note(inner_caption, reuse_note(inner)),
                 media: dedup_media(inner_media),
                 original_url: original_url.to_string(),
             }));
@@ -367,11 +409,24 @@ fn build_post(node: &Value, original_url: &str) -> Result<Option<Post>, MediaReq
     Ok(None)
 }
 
+/// Append an attribution line below the caption (or use it alone).
+fn with_note(caption: Option<String>, note: Option<String>) -> Option<String> {
+    let Some(note) = note else {
+        return caption;
+    };
+    Some(match caption {
+        Some(c) if !c.trim().is_empty() => format!("{}\n\n{note}", c.trim_end()),
+        _ => note,
+    })
+}
+
 fn caption_of(node: &Value) -> Option<String> {
     node.pointer("/caption/text")
         .and_then(Value::as_str)
+        // U+FFFC marks where an attachment (e.g. reused media) sits in the
+        // text; Telegram would render it as a stray placeholder box.
+        .map(|s| s.replace('\u{FFFC}', ""))
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
 }
 
 fn author_of(node: &Value) -> Option<String> {
@@ -404,6 +459,30 @@ fn quote_note(inner: &Value) -> Option<String> {
         )),
         None => Some(format!("🔁 Quoting @{user}")),
     }
+}
+
+/// Credit line for reused media, mirroring the creator handle Threads overlays
+/// on it: `📎 Media from @user: <url>`. Skipped when the source withholds
+/// attribution or is the post's own author.
+fn reuse_note(node: &Value) -> Option<String> {
+    let source = reused_source(node)?;
+    let allowed = node
+        .pointer("/text_post_app_info/share_info/quoted_attachment_author_attribution_allowed")
+        .and_then(Value::as_bool);
+    if allowed == Some(false) {
+        return None;
+    }
+    let user = author_of(source)?;
+    if author_of(node).as_deref() == Some(user.as_str()) {
+        return None;
+    }
+    Some(match source.get("code").and_then(Value::as_str) {
+        Some(code) => format!(
+            "📎 Media from @{user}: {}",
+            crate::urls::threads_post_url(&user, code)
+        ),
+        None => format!("📎 Media from @{user}"),
+    })
 }
 
 pub(super) fn looks_login_walled(html: &str) -> bool {
@@ -655,14 +734,154 @@ mod tests {
         assert!(p.caption.unwrap().contains("Quoting @original"));
     }
 
-    #[tokio::test]
-    #[ignore = "LIVE: public Threads network probe; no cookies or Telegram sends"]
-    async fn live_reported_share_and_reference_posts_use_production_chain() {
+    #[test]
+    fn captured_reused_media_page_resolves_source_or_reports_it_missing() {
+        let html = include_str!("../../tests/fixtures/threads_json_reused_media.html");
+        // Visible source: its video is the attachment, credited like the handle
+        // Threads overlays on it; the U+FFFC placeholder is dropped.
+        let p = post(html, "REUSE").unwrap();
+        assert_eq!(p.author.as_deref(), Some("example.author"));
+        assert_eq!(p.media.len(), 1, "the source video, not its poster");
+        assert_eq!(p.media[0].kind, MediaKind::Video);
+        assert_eq!(
+            p.media[0].url,
+            "https://scontent.cdninstagram.com/o1/v/reused.mp4?efg=example%3D%3D&oe=EXAMPLE"
+        );
+        assert_eq!(
+            p.caption.as_deref(),
+            Some("Reused clip caption\n\n📎 Media from @source.creator: https://www.threads.com/@source.creator/post/SOURCE")
+        );
+        // Hidden source (the reported post): a known attachment, never text-only.
+        match parse_threads_post(html, "SC", "u") {
+            ParseOutcome::Incomplete(required) => assert_eq!(
+                required,
+                MediaRequirements {
+                    total: 1,
+                    images: 0,
+                    videos: 0
+                }
+            ),
+            other => panic!("expected an unresolved reused attachment, got {other:?}"),
+        }
+        // The embedded source is interpreted, never promoted to a target.
+        assert!(matches!(
+            parse_threads_post(html, "SOURCE", "u"),
+            ParseOutcome::EmptyShell
+        ));
+    }
+
+    #[test]
+    fn reused_media_variants_keep_order_credit_policy_and_completeness() {
+        let source = |user: &str| {
+            serde_json::json!({"code":"SRC","user":{"username":user},"media_type":2,
+                "video_versions":[{"url":"https://scontent.cdninstagram.com/v/source.mp4"}]})
+        };
+        let reusing = |share: Value| {
+            serde_json::json!({"code":"SC","media_type":19,"caption":{"text":"outer"},
+                "user":{"username":"outer"},"text_post_app_info":{"share_info":share}})
+        };
+        let credit = "📎 Media from @other: https://www.threads.com/@other/post/SRC";
+
+        // Attribution withheld, or an author reusing their own media: no credit.
+        for share in [
+            serde_json::json!({"quoted_attachment_author_attribution_allowed":false,"quoted_attachment_post":source("other")}),
+            serde_json::json!({"quoted_attachment_post":source("outer")}),
+        ] {
+            let p = post(&data_media(reusing(share)), "SC").unwrap();
+            assert_eq!(p.media[0].kind, MediaKind::Video);
+            assert_eq!(p.caption.as_deref(), Some("outer"));
+        }
+
+        // A source without recognizable media is still a known attachment.
+        let stub = reusing(
+            serde_json::json!({"quoted_attachment_post":{"code":"SRC","user":{"username":"other"}}}),
+        );
+        assert!(matches!(
+            parse_threads_post(&data_media(stub), "SC", "u"),
+            ParseOutcome::Incomplete(_)
+        ));
+
+        // Ordinary posts carry the same keys, unset: still a text-only success.
+        let plain = reusing(
+            serde_json::json!({"quoted_attachment_post_unavailable":false,"quoted_attachment_post":null}),
+        );
+        assert!(post(&data_media(plain), "SC").unwrap().media.is_empty());
+
+        // Own media first, then the reused source; a placeholder-only caption
+        // leaves just the credit.
+        let mut both = reusing(serde_json::json!({"quoted_attachment_post":source("other")}));
+        both["media_type"] = 1.into();
+        both["image_versions2"] = serde_json::json!({"candidates":[{"url":"https://scontent.cdninstagram.com/v/own.jpg"}]});
+        both["caption"] = serde_json::json!({"text":"\u{FFFC}"});
+        let p = post(&data_media(both), "SC").unwrap();
+        assert_eq!(
+            p.media.iter().map(|m| m.kind).collect::<Vec<_>>(),
+            [MediaKind::Image, MediaKind::Video]
+        );
+        assert_eq!(p.caption.as_deref(), Some(credit));
+
+        // A pure repost of a reusing post mirrors the original, credit included.
+        let original = reusing(serde_json::json!({"quoted_attachment_post":source("other")}));
+        let repost = serde_json::json!({"code":"RP","user":{"username":"reposter"},
+            "text_post_app_info":{"share_info":{"reposted_post":original}}});
+        let p = post(&data_media(repost), "RP").unwrap();
+        assert_eq!(p.author.as_deref(), Some("outer"));
+        assert_eq!(p.media.len(), 1);
+        assert_eq!(p.caption, Some(format!("outer\n\n{credit}")));
+    }
+
+    /// Production header set (or its env overrides) for the live probes.
+    fn live_config() -> crate::config::Config {
         let mut cfg = crate::config::Config::test_default();
         cfg.threads_user_agent = std::env::var("THREADS_USER_AGENT").unwrap_or_else(|_| "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36".into());
         cfg.threads_sec_ch_ua = std::env::var("THREADS_SEC_CH_UA").unwrap_or_else(|_| {
             r#""Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126""#.into()
         });
+        cfg
+    }
+
+    #[tokio::test]
+    #[ignore = "LIVE: public Threads network probe; no cookies or Telegram sends"]
+    async fn live_reused_media_posts_use_production_chain() {
+        let cfg = live_config();
+        let (http, _) = crate::threads_http::clients(None).unwrap();
+        let chain = super::super::build_threads_chain(&cfg, http);
+        // Reuses a video whose source logged-out viewers can see.
+        let p = chain
+            .extract(
+                "https://www.threads.com/@ther_nice/post/De8G8eVkmOJ",
+                "De8G8eVkmOJ",
+            )
+            .await
+            .unwrap();
+        assert_eq!(p.author.as_deref(), Some("ther_nice"));
+        assert_eq!(p.media.len(), 1, "exactly the reused video, no poster");
+        assert_eq!(p.media[0].kind, MediaKind::Video);
+        let caption = p.caption.unwrap_or_default();
+        assert!(caption.contains("📎 Media from @c.cyriil"), "{caption}");
+        assert!(!caption.contains('\u{FFFC}'));
+        // The reported post: its source is hidden from logged-out viewers. It
+        // may resolve or be reported missing, but is never a text-only mirror.
+        let reported = chain
+            .extract(
+                "https://www.threads.com/@ther_nice/post/De6l_zBlFVq",
+                "De6l_zBlFVq",
+            )
+            .await;
+        match &reported {
+            Ok(p) => assert!(!p.media.is_empty(), "text-only mirror"),
+            Err(e) => assert!(matches!(e, ExtractError::IncompleteMedia(_)), "{e:?}"),
+        }
+        eprintln!(
+            "LIVE De8G8eVkmOJ attachments=1 kind=Video credit=yes; De6l_zBlFVq outcome={:?}",
+            reported.map(|p| p.media.len())
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "LIVE: public Threads network probe; no cookies or Telegram sends"]
+    async fn live_reported_share_and_reference_posts_use_production_chain() {
+        let cfg = live_config();
         let (http, share_http) = crate::threads_http::clients(None).unwrap();
         let resolver = crate::threads_share::ThreadsShareResolver::with_client(
             share_http,

@@ -69,9 +69,11 @@ in-process only):
    `THREADS_SEC_CH_UA`); a naive UA gets an empty shell, which is treated as a
    failure, never a silent success. Reads both modern `data.media` and legacy
    `thread_items` responses, matching the requested shortcode. Covers images,
-   video, carousels, text-only posts, inline-shared Instagram media, and
-   reposts/quotes. Poll/link-card caption text is supported; poll options,
-   audio, and extended-text attachments are not separately rendered.
+   video, carousels, text-only posts, inline-shared Instagram media, media
+   reused from another Threads post (Threads' "Use media", credited to its
+   creator), and reposts/quotes. Poll/link-card caption text is supported;
+   poll options, audio, and extended-text attachments are not separately
+   rendered.
 2. **threads-embed** — fallback parse of the `/embed` SSR HTML card. Uses actual
    attachment containers, excludes avatars and link-preview decoration, and
    extracts the username from its profile link.
@@ -80,7 +82,8 @@ Known missing attachments are not treated as text-only success. The bot tries
 available video renditions and fallback extraction; if it still cannot retrieve
 all expected media, it replies with an explanation and the original link so the
 post can be retried. Instagram cards without usable inline media are reported
-as incomplete; the bot does not automatically fetch arbitrary linked pages.
+as incomplete, as is reused media whose source post the bot's session can't
+see; the bot does not automatically fetch arbitrary linked pages.
 
 Cookieless-first: no Instagram **or** Threads login required for the default
 chains.
@@ -138,8 +141,8 @@ cd instagram_tg_bot
 
 # 2. download + verify the release binary
 cd /tmp
-base=igbot-v0.4.3-linux-x86_64.tar.gz
-url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.3
+base=igbot-v0.4.4-linux-x86_64.tar.gz
+url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.4
 curl -L -O "$url/$base" && curl -L -O "$url/$base.sha256"
 sha256sum -c "$base.sha256" && tar -xzf "$base"   # → /tmp/igbot
 
@@ -169,7 +172,7 @@ automatically** if the new one doesn't come up within ~20 s:
 ```bash
 cd ~/instagram_tg_bot && git pull
 sudo bash deploy/upgrade.sh              # newest release
-sudo bash deploy/upgrade.sh v0.4.3       # pin a tag — also how you roll back
+sudo bash deploy/upgrade.sh v0.4.4       # pin a tag — also how you roll back
 sudo bash deploy/upgrade.sh --dry-run    # resolve + download + verify + compare only
 ```
 
@@ -189,13 +192,13 @@ working defaults, so `igbot.env` usually needs no changes. Two exceptions:
   posts and Threads keep working exactly as before.
 
 **Manual equivalent** of the script, if you'd rather see each step (replace
-`v0.4.3` with the tag you're moving to):
+`v0.4.4` with the tag you're moving to):
 
 ```bash
 # 1. download + verify the new release
 cd /tmp
-base=igbot-v0.4.3-linux-x86_64.tar.gz
-url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.3
+base=igbot-v0.4.4-linux-x86_64.tar.gz
+url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.4
 curl -L -O "$url/$base" && curl -L -O "$url/$base.sha256"
 sha256sum -c "$base.sha256" && tar -xzf "$base" -C /tmp   # → /tmp/igbot
 

@@ -61,7 +61,8 @@ takes the canonical post `url` + shortcode and returns a `Post`, so it serves
 both platforms (route by **host**, not shortcode). The IG embed scraper and the
 Threads JSON scraper share the Polaris media collection. Threads checks both
 modern `data.media` and legacy `thread_items` JSON envelopes by exact shortcode,
-then collects own and inline-linked Instagram media.
+then collects own media, inline-linked Instagram media, and media reused from
+another Threads post ("Use media": `share_info.quoted_attachment_post`).
 yt-dlp/gallery-dl do **not** support Threads, so the Threads chain is in-process
 only (`threads_json` primary, `threads_embed` the `/embed`-HTML fallback).
 
@@ -99,6 +100,14 @@ only (`threads_json` primary, `threads_embed` the `/embed`-HTML fallback).
   `IncompleteMedia` carries total/image/video requirements through fallback;
   text, a poster, or a partial album cannot mask that failure. A later complete
   result may recover it. The IG chain keeps media required.
+- **Threads "Use media" is an attachment, not a quote.** A post that reuses
+  another post's photo/video carries the source as a full Polaris node under
+  `share_info.quoted_attachment_post`; deliver its media after the post's own
+  (plus a `📎 Media from @user` credit unless attribution is withheld). When the
+  bot's session can't see the source, the node is `null` with
+  `quoted_attachment_post_unavailable: true` — a known missing attachment
+  (`IncompleteMedia`), never a text-only mirror. Captions then carry a U+FFFC
+  placeholder; strip it. Never promote the embedded source to a target.
 - **Threads header gate**: the post JSON is served logged-out **only** to a
   *coherent desktop-browser* header set (`THREADS_USER_AGENT` /
   `THREADS_SEC_CH_UA`, hot-config). A naive/crawler UA returns HTTP 200 + an

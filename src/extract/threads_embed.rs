@@ -511,6 +511,37 @@ mod tests {
     }
 
     #[test]
+    fn reused_media_is_an_attachment_and_its_credit_overlay_is_not_text() {
+        // Representative structure reduced from a live "Use media" embed (2026-10):
+        // the reused video sits in the post's own media container, with the
+        // source creator's handle as an overlay.
+        let html = r#"<div class="OuterContainer OuterContainerFull">
+            <div class="AvatarContainer"><img class="img" src="https://scontent.cdninstagram.com/avatar.jpg"></div>
+            <div class="HeaderContainer"><div class="NameContainer">
+                <div class="AuthorIdentity"><a class="HeaderLink" href="https://www.threads.com/@owner?xmt=x"><span>owner</span></a></div>
+                <div class="HeaderTrailingActions"><a class="EmbedFollowButton" href="https://www.threads.com/intent/follow?username=owner">Follow</a></div>
+            </div></div>
+            <div class="BodyContainerNoThreadLine">
+                <span class="TextContentContainer"><span class="BodyTextContainer"><span>reused caption</span></span></span>
+                <div class="SoloMediaContainer"><div class="SingleInnerMediaContainerVideo SingleInnerMediaContainer">
+                    <video><source src="https://scontent.cdninstagram.com/o1/v/reused.mp4?efg=e&amp;oe=E"></video>
+                    <div class="VideoPlayOverlay"></div>
+                    <div class="MediaReuseOverlay"><span class="MediaReuseOverlayText">source.creator</span></div>
+                </div></div>
+            </div>
+        </div>"#;
+        let p = parse_response(html, "orig").unwrap();
+        assert_eq!(p.author.as_deref(), Some("owner"));
+        assert_eq!(p.caption.as_deref(), Some("reused caption"));
+        assert_eq!(p.media.len(), 1);
+        assert_eq!(p.media[0].kind, MediaKind::Video);
+        assert_eq!(
+            p.media[0].url,
+            "https://scontent.cdninstagram.com/o1/v/reused.mp4?efg=e&oe=E"
+        );
+    }
+
+    #[test]
     fn embed_nested_avatar_does_not_turn_text_into_media() {
         let avatar = r#"<div class="AvatarContainer extra"><a><span>
             <img class="img" src="https://scontent.cdninstagram.com/avatar.jpg">

@@ -86,7 +86,9 @@ only (`threads_json` primary, `threads_embed` the `/embed`-HTML fallback).
   failure notice. Only provably-not-posted errors (flood-wait, connect-phase)
   get the one-shot retry. Keep `TG_SEND_TIMEOUT_SECS` generous — a short client
   timeout manufactures phantom "couldn't send" failures for sends that landed.
-- **Bot API upload cap is 50 MB.** Oversize media → reply with link + note.
+- **Official Bot API upload cap is 50 MB.** The download fallback caps
+  `MAX_UPLOAD_BYTES` at 50 MiB in official mode. Local mode uses the configured
+  value. A single oversize item gets a link and a size notice.
 - **`panic = "abort"` in release** → panics can't be caught; they abort the
   process. Prevent them: no `unwrap()`/`expect()` on runtime-fallible paths, and
   keep the `preflight` `get_me` guard before `dispatch()` (teloxide panics if its

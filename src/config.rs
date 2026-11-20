@@ -26,7 +26,7 @@ const DEFAULT_EMBED_UA: &str = "facebookexternalhit/1.1 \
 const DEFAULT_THREADS_SEC_CH_UA: &str =
     "\"Not/A)Brand\";v=\"8\", \"Chromium\";v=\"126\", \"Google Chrome\";v=\"126\"";
 
-const FIFTY_MIB: u64 = 50 * 1024 * 1024;
+const OFFICIAL_MAX_UPLOAD_BYTES: u64 = 50 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -63,6 +63,7 @@ pub struct Config {
     /// `sec-ch-ua` client-hint sent with the Threads scrape; keep coherent with
     /// `threads_user_agent`. Hot-config `THREADS_SEC_CH_UA`.
     pub threads_sec_ch_ua: String,
+    /// Effective per-item limit for downloading and uploading a local file.
     pub max_upload_bytes: u64,
     pub queue_capacity: usize,
     pub job_timeout: Duration,
@@ -80,12 +81,17 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self, AppError> {
+        let bot_token = req("TELEGRAM_BOT_TOKEN")?;
+        let telegram_bot_api_url = telegram_bot_api_url(
+            opt("TELEGRAM_BOT_API_MODE").as_deref(),
+            opt("TELEGRAM_BOT_API_URL").as_deref(),
+        )?;
+        let configured_upload_limit = parse_u64("MAX_UPLOAD_BYTES", OFFICIAL_MAX_UPLOAD_BYTES)?;
+        let max_upload_bytes =
+            effective_upload_limit(configured_upload_limit, telegram_bot_api_url.is_some());
         Ok(Self {
-            bot_token: req("TELEGRAM_BOT_TOKEN")?,
-            telegram_bot_api_url: telegram_bot_api_url(
-                opt("TELEGRAM_BOT_API_MODE").as_deref(),
-                opt("TELEGRAM_BOT_API_URL").as_deref(),
-            )?,
+            bot_token,
+            telegram_bot_api_url,
             allowed_chats: match opt("ALLOWED_CHAT_IDS") {
                 Some(s) => parse_chat_ids(&s)?,
                 None => Vec::new(),
@@ -108,7 +114,7 @@ impl Config {
             threads_user_agent: opt("THREADS_USER_AGENT").unwrap_or_else(|| DEFAULT_UA.into()),
             threads_sec_ch_ua: opt("THREADS_SEC_CH_UA")
                 .unwrap_or_else(|| DEFAULT_THREADS_SEC_CH_UA.into()),
-            max_upload_bytes: parse_u64("MAX_UPLOAD_BYTES", FIFTY_MIB)?,
+            max_upload_bytes,
             queue_capacity: parse_u64("QUEUE_CAPACITY", 16)? as usize,
             // Must comfortably exceed a full delivery (extraction + downloads
             // + several album sends) — expiring mid-send cancels a request
@@ -180,13 +186,21 @@ embed_ua={:?}",
             ig_story_max_items: Some(10),
             threads_user_agent: "th-ua".into(),
             threads_sec_ch_ua: "th-ch".into(),
-            max_upload_bytes: FIFTY_MIB,
+            max_upload_bytes: OFFICIAL_MAX_UPLOAD_BYTES,
             queue_capacity: 16,
             job_timeout: Duration::from_secs(300),
             tg_send_timeout: Duration::from_secs(120),
             request_pacing: Duration::from_millis(1500),
             heartbeat: Some(Duration::from_secs(3600)),
         }
+    }
+}
+
+fn effective_upload_limit(configured_limit: u64, use_local_api: bool) -> u64 {
+    if use_local_api {
+        configured_limit
+    } else {
+        configured_limit.min(OFFICIAL_MAX_UPLOAD_BYTES)
     }
 }
 
@@ -284,6 +298,18 @@ fn parse_chat_ids(s: &str) -> Result<Vec<i64>, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn official_mode_caps_a_large_upload_setting_at_fifty_mib() {
+        let local_limit = 1_048_576_000;
+        assert_eq!(
+            effective_upload_limit(local_limit, false),
+            OFFICIAL_MAX_UPLOAD_BYTES
+        );
+        assert_eq!(effective_upload_limit(local_limit, true), local_limit);
+        let lower_limit = 25 * 1024 * 1024;
+        assert_eq!(effective_upload_limit(lower_limit, false), lower_limit);
+    }
 
     #[test]
     fn official_bot_api_ignores_the_local_endpoint() {

@@ -142,7 +142,7 @@ cd instagram_tg_bot
 # 2. download + verify the release binary
 cd /tmp
 base=igbot-v0.4.4-linux-x86_64.tar.gz
-url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.5
+url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.6
 curl -L -O "$url/$base" && curl -L -O "$url/$base.sha256"
 sha256sum -c "$base.sha256" && tar -xzf "$base"   # → /tmp/igbot
 
@@ -198,7 +198,7 @@ working defaults, so `igbot.env` usually needs no changes. Two exceptions:
 # 1. download + verify the new release
 cd /tmp
 base=igbot-v0.4.4-linux-x86_64.tar.gz
-url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.5
+url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.6
 curl -L -O "$url/$base" && curl -L -O "$url/$base.sha256"
 sha256sum -c "$base.sha256" && tar -xzf "$base" -C /tmp   # → /tmp/igbot
 
@@ -283,7 +283,8 @@ MAX_UPLOAD_BYTES=104857600
 
 Use the base URL your API server provides. For a server on the same host or
 behind a tunnel, it can be `http://127.0.0.1:8081`. The upload setting above
-allows up to 100 MiB per media download. Omit it to use the 50 MiB default.
+allows up to 100 MiB per media download in local mode. The default is 50 MiB.
+Official mode uses 50 MiB or your configured value, whichever is lower.
 
 Keep the same bot token. When moving an existing bot from Telegram's hosted
 API, stop `igbot`, call `logOut` on the hosted API, then start `igbot` with the
@@ -291,7 +292,7 @@ new settings. Telegram blocks logging back into its hosted API for 10 minutes
 after logout. [Telegram's migration instructions](https://core.telegram.org/bots/api#logout)
 
 To switch back, stop `igbot`, call `logOut` on the local server, then restart
-with `TELEGRAM_BOT_API_MODE=official` and the 50 MiB download cap.
+with `TELEGRAM_BOT_API_MODE=official`.
 
 ## Cookies (optional — Instagram Stories + gallery-dl)
 
@@ -449,7 +450,8 @@ kills them immediately.
   origin is hidden (user privacy setting, or a channel the bot posted into) is
   not attributable to the bot and is processed like any other message.
 - Albums are sent as up to 10 items (Telegram album max); extras are noted.
-- Bot API upload cap is 50 MB; larger videos get a link + note instead.
+- The official Bot API caps video uploads at 50 MB. Larger single videos get a
+  link and a size notice. In local mode, the bot uses the configured download cap.
 - This scrapes public, logged-out content. Adding burner cookies is opt-in and
   disposable.
 

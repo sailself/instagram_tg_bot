@@ -6,6 +6,7 @@
 use crate::error::AppError;
 use std::path::PathBuf;
 use std::time::Duration;
+use url::Url;
 
 /// A realistic desktop-Chrome UA; hot-config via `USER_AGENT` (PLAN §4.4).
 /// Used for CDN media downloads.
@@ -30,6 +31,8 @@ const FIFTY_MIB: u64 = 50 * 1024 * 1024;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bot_token: String,
+    /// Base URL of a self-hosted Bot API server. `None` uses Telegram's hosted API.
+    pub telegram_bot_api_url: Option<Url>,
     /// Empty => allow any chat (logged as a warning at startup).
     pub allowed_chats: Vec<i64>,
     pub temp_dir: PathBuf,
@@ -79,6 +82,10 @@ impl Config {
     pub fn from_env() -> Result<Self, AppError> {
         Ok(Self {
             bot_token: req("TELEGRAM_BOT_TOKEN")?,
+            telegram_bot_api_url: telegram_bot_api_url(
+                opt("TELEGRAM_BOT_API_MODE").as_deref(),
+                opt("TELEGRAM_BOT_API_URL").as_deref(),
+            )?,
             allowed_chats: match opt("ALLOWED_CHAT_IDS") {
                 Some(s) => parse_chat_ids(&s)?,
                 None => Vec::new(),
@@ -121,10 +128,16 @@ impl Config {
     /// startup log. Never emits the bot token, cookies path, or API keys — only
     /// booleans for those (see `summary_omits_secrets` test).
     pub fn summary(&self) -> String {
+        let telegram_api_mode = if self.telegram_bot_api_url.is_some() {
+            "local"
+        } else {
+            "official"
+        };
         format!(
-            "allowed_chats={} queue_cap={} cache_ttl={}s job_timeout={}s send_timeout={}s pacing={}ms \
+            "telegram_api={} allowed_chats={} queue_cap={} cache_ttl={}s job_timeout={}s send_timeout={}s pacing={}ms \
 max_upload={}MB cookies={} fallback={} threads={} threads_cookies={} stories={} story_max={} jina_key={} heartbeat={} \
 embed_ua={:?}",
+            telegram_api_mode,
             self.allowed_chats.len(),
             self.queue_capacity,
             self.cache_ttl.as_secs(),
@@ -150,6 +163,7 @@ embed_ua={:?}",
     pub fn test_default() -> Self {
         Self {
             bot_token: "t".into(),
+            telegram_bot_api_url: None,
             allowed_chats: vec![],
             temp_dir: PathBuf::from("."),
             cache_ttl: Duration::from_secs(1),
@@ -174,6 +188,45 @@ embed_ua={:?}",
             heartbeat: Some(Duration::from_secs(3600)),
         }
     }
+}
+
+fn telegram_bot_api_url(
+    mode: Option<&str>,
+    endpoint: Option<&str>,
+) -> Result<Option<Url>, AppError> {
+    const URL_VAR: &str = "TELEGRAM_BOT_API_URL";
+    let mode = mode.unwrap_or("official").trim();
+    if mode.eq_ignore_ascii_case("official") {
+        return Ok(None);
+    }
+    if !mode.eq_ignore_ascii_case("local") {
+        return Err(AppError::InvalidEnv {
+            var: "TELEGRAM_BOT_API_MODE",
+            msg: "expected official or local".into(),
+        });
+    }
+
+    let endpoint = endpoint
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(AppError::MissingEnv(URL_VAR))?;
+    // Teloxide appends path segments directly, so strip trailing slashes from
+    // reverse-proxy prefixes to avoid sending requests with a double slash.
+    Url::parse(endpoint.trim_end_matches('/'))
+        .ok()
+        .filter(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && url.has_host()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+        })
+        .map(Some)
+        .ok_or_else(|| AppError::InvalidEnv {
+            var: URL_VAR,
+            msg: "expected an HTTP(S) base URL without credentials, a query, or a fragment".into(),
+        })
 }
 
 /// Map `IG_STORY_MAX_ITEMS` to a cap; `0` means unlimited.
@@ -233,6 +286,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn official_bot_api_ignores_the_local_endpoint() {
+        assert_eq!(telegram_bot_api_url(None, None).unwrap(), None);
+        assert_eq!(
+            telegram_bot_api_url(Some("official"), Some("invalid-url")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn local_bot_api_accepts_loopback_and_proxy_prefixes() {
+        for (endpoint, expected) in [
+            ("http://127.0.0.1:8081/", "http://127.0.0.1:8081/"),
+            (
+                " https://bot.example.org/telegram// ",
+                "https://bot.example.org/telegram",
+            ),
+        ] {
+            let url = telegram_bot_api_url(Some("local"), Some(endpoint))
+                .unwrap()
+                .unwrap();
+            assert_eq!(url.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn invalid_bot_api_settings_fail_without_echoing_the_endpoint() {
+        assert!(matches!(
+            telegram_bot_api_url(Some("offical"), None),
+            Err(AppError::InvalidEnv {
+                var: "TELEGRAM_BOT_API_MODE",
+                ..
+            })
+        ));
+        assert!(matches!(
+            telegram_bot_api_url(Some("local"), Some(" ")),
+            Err(AppError::MissingEnv("TELEGRAM_BOT_API_URL"))
+        ));
+        for endpoint in [
+            "example.org",
+            "ftp://example.org",
+            "https://user:password@example.org",
+            "https://example.org?key=secret",
+            "https://example.org#secret",
+        ] {
+            let error = telegram_bot_api_url(Some("local"), Some(endpoint)).unwrap_err();
+            assert!(matches!(
+                error,
+                AppError::InvalidEnv {
+                    var: "TELEGRAM_BOT_API_URL",
+                    ..
+                }
+            ));
+            assert!(!error.to_string().contains(endpoint));
+        }
+    }
+
+    #[test]
     fn chat_allowlist_empty_allows_all() {
         let c = bare();
         assert!(c.chat_allowed(123));
@@ -259,15 +369,19 @@ mod tests {
     fn summary_omits_secrets() {
         let mut c = bare();
         c.bot_token = "123456:SUPER-SECRET-TOKEN".into();
+        c.telegram_bot_api_url =
+            Some(Url::parse("https://bot.example.org/private-prefix").unwrap());
         c.ig_cookies_path = Some("/etc/igbot/cookies-SECRET.txt".into());
         c.jina_api_key = Some("jina-key-SECRET".into());
         assert!(c.threads_cookies_path.is_none());
         c.threads_cookies_path = Some("threads-SECRET.txt".into());
         let s = c.summary();
         assert!(!s.contains("SUPER-SECRET-TOKEN"), "token leaked: {s}");
+        assert!(!s.contains("private-prefix"), "API endpoint leaked: {s}");
         assert!(!s.contains("cookies-SECRET.txt"), "cookies path leaked: {s}");
         assert!(!s.contains("jina-key-SECRET"), "jina key leaked: {s}");
         // The non-secret booleans/values are still present.
+        assert!(s.contains("telegram_api=local"));
         assert!(s.contains("cookies=true"));
         assert!(s.contains("jina_key=true"));
         assert!(s.contains("threads_cookies=true"));

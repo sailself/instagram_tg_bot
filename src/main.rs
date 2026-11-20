@@ -49,8 +49,11 @@ async fn main() -> Result<()> {
         .timeout(cfg.tg_send_timeout)
         .build()?;
     // Throttled bot (innermost wrap) for built-in rate limiting (PLAN §5).
-    let tgbot =
-        teloxide::Bot::with_client(cfg.bot_token.clone(), tg_http).throttle(Limits::default());
+    let mut bot = teloxide::Bot::with_client(cfg.bot_token.clone(), tg_http);
+    if let Some(base_url) = &cfg.telegram_bot_api_url {
+        bot = bot.set_api_url(base_url.clone());
+    }
+    let tgbot = bot.throttle(Limits::default());
     preflight(&tgbot).await?;
     // Subprocess backends: warn now if a configured binary can't run, instead
     // of discovering it one failed job at a time.

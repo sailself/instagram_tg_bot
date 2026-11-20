@@ -142,7 +142,7 @@ cd instagram_tg_bot
 # 2. download + verify the release binary
 cd /tmp
 base=igbot-v0.4.4-linux-x86_64.tar.gz
-url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.4
+url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.5
 curl -L -O "$url/$base" && curl -L -O "$url/$base.sha256"
 sha256sum -c "$base.sha256" && tar -xzf "$base"   # → /tmp/igbot
 
@@ -198,7 +198,7 @@ working defaults, so `igbot.env` usually needs no changes. Two exceptions:
 # 1. download + verify the new release
 cd /tmp
 base=igbot-v0.4.4-linux-x86_64.tar.gz
-url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.4
+url=https://github.com/sailself/instagram_tg_bot/releases/download/v0.4.5
 curl -L -O "$url/$base" && curl -L -O "$url/$base.sha256"
 sha256sum -c "$base.sha256" && tar -xzf "$base" -C /tmp   # → /tmp/igbot
 
@@ -253,6 +253,8 @@ See [`.env.example`](.env.example) for everything. Key variables:
 | Variable | Purpose |
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | **required** — BotFather token |
+| `TELEGRAM_BOT_API_MODE` | `official` (default) or `local` for polling and sending |
+| `TELEGRAM_BOT_API_URL` | Bot API server base URL, required in local mode |
 | `ALLOWED_CHAT_IDS` | comma-separated chat ids; empty = any chat |
 | `EMBED_USER_AGENT` | crawler UA for the IG embed scraper (hot-config) |
 | `THREADS_COOKIES_PATH` | Optional Netscape cookie export from a disposable Threads account; read-only, loaded at startup. Restart after replacement. Never enabled implicitly by `IG_COOKIES_PATH`. |
@@ -267,6 +269,29 @@ See [`.env.example`](.env.example) for everything. Key variables:
 
 Brittle bits (User-Agent, endpoints, timeouts) are hot-config via env so a break
 is a config change, not a recompile.
+
+### Local Telegram Bot API
+
+To use a server running with `--local`, set these in `.env` or in
+`/etc/igbot/igbot.env` for the systemd service.
+
+```dotenv
+TELEGRAM_BOT_API_MODE=local
+TELEGRAM_BOT_API_URL=https://bot-api.example.org
+MAX_UPLOAD_BYTES=104857600
+```
+
+Use the base URL your API server provides. For a server on the same host or
+behind a tunnel, it can be `http://127.0.0.1:8081`. The upload setting above
+allows up to 100 MiB per media download. Omit it to use the 50 MiB default.
+
+Keep the same bot token. When moving an existing bot from Telegram's hosted
+API, stop `igbot`, call `logOut` on the hosted API, then start `igbot` with the
+new settings. Telegram blocks logging back into its hosted API for 10 minutes
+after logout. [Telegram's migration instructions](https://core.telegram.org/bots/api#logout)
+
+To switch back, stop `igbot`, call `logOut` on the local server, then restart
+with `TELEGRAM_BOT_API_MODE=official` and the 50 MiB download cap.
 
 ## Cookies (optional — Instagram Stories + gallery-dl)
 
